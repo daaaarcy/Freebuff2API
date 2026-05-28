@@ -265,7 +265,7 @@ func (s *Server) proxyChatRequest(
 	}
 
 	for attempt := 0; attempt < 2; attempt++ {
-		lease, err := s.runs.Acquire(r.Context(), agentID)
+		lease, err := s.runs.Acquire(r.Context(), agentID, requestedModel)
 		if err != nil {
 			var waitingErr *waitingRoomError
 			if errors.As(err, &waitingErr) {
@@ -281,7 +281,7 @@ func (s *Server) proxyChatRequest(
 
 		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.name, requestedModel, lease.run.id)
 
-		sessionInstanceID, err := lease.pool.ensureSession(r.Context())
+		sessionInstanceID, err := lease.pool.ensureSession(r.Context(), requestedModel)
 		if err != nil {
 			s.runs.Release(lease)
 			var waitingErr *waitingRoomError
@@ -321,22 +321,24 @@ func (s *Server) proxyChatRequest(
 		}
 
 		if isSessionInvalid(resp.StatusCode, errorBody) {
-			s.logger.Printf("%s: free session invalid, refreshing and retrying", lease.pool.name)
-			lease.pool.invalidateSession(strings.TrimSpace(string(errorBody)))
+			s.logger.Printf("%s: free session invalid (status=%d, body=%s), refreshing and retrying", lease.pool.name, resp.StatusCode, strings.TrimSpace(string(errorBody)))
+			lease.pool.invalidateSession(requestedModel, strings.TrimSpace(string(errorBody)))
 			s.runs.Release(lease)
 			continue
 		}
 
 		if isRunInvalid(resp.StatusCode, errorBody) {
-			s.logger.Printf("%s: run %s invalid, rotating and retrying", lease.pool.name, lease.run.id)
+			s.logger.Printf("%s: run %s invalid (status=%d, body=%s), rotating and retrying", lease.pool.name, lease.run.id, resp.StatusCode, strings.TrimSpace(string(errorBody)))
 			s.runs.Invalidate(lease, strings.TrimSpace(string(errorBody)))
 			s.runs.Release(lease)
 			continue
 		}
 
+		s.logger.Printf("[%s] upstream error (attempt %d, status=%d): %s", lease.pool.name, attempt, resp.StatusCode, strings.TrimSpace(string(errorBody)))
+
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.runs.Cooldown(lease, 30*time.Minute, "upstream auth rejected token")
-			lease.pool.invalidateSession("upstream auth rejected token")
+			lease.pool.invalidateSession(requestedModel, "upstream auth rejected token")
 		}
 
 		s.runs.Release(lease)
@@ -395,7 +397,7 @@ func isSessionInvalid(statusCode int, errorBody []byte) bool {
 		return false
 	}
 	switch strings.TrimSpace(payload.Error) {
-	case "freebuff_update_required", "waiting_room_required", "waiting_room_queued", "session_superseded", "session_expired":
+	case "freebuff_update_required", "waiting_room_required", "waiting_room_queued", "session_superseded", "session_expired", "session_model_mismatch":
 		return true
 	default:
 		return false

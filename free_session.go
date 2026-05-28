@@ -48,18 +48,19 @@ type cachedSession struct {
 	retryAfter time.Duration
 }
 
-func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
+func (p *tokenPool) ensureSession(ctx context.Context, model string) (string, error) {
 	for {
 		p.mu.Lock()
-		if instanceID, ready := p.readySessionLocked(time.Now()); ready {
+		if instanceID, ready := p.readySessionLocked(model, time.Now()); ready {
 			p.mu.Unlock()
 			return instanceID, nil
 		}
-		if waitingErr := waitingRoomErrorFromSession(p.name, p.session, time.Now()); waitingErr != nil {
+		session := p.sessions[model]
+		if waitingErr := waitingRoomErrorFromSession(p.name, session, time.Now()); waitingErr != nil {
 			p.mu.Unlock()
 			return "", waitingErr
 		}
-		if ch := p.sessionRefreshCh; ch != nil {
+		if ch := p.sessionRefreshCh[model]; ch != nil {
 			p.mu.Unlock()
 			select {
 			case <-ctx.Done():
@@ -69,29 +70,29 @@ func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
 			}
 		}
 		ch := make(chan struct{})
-		p.sessionRefreshCh = ch
+		p.sessionRefreshCh[model] = ch
 		p.mu.Unlock()
 
-		session, instanceID, err := p.refreshSession(ctx)
+		newSession, instanceID, err := p.refreshSession(ctx, model)
 
 		p.mu.Lock()
-		if session != nil {
-			p.session = session
+		if newSession != nil {
+			p.sessions[model] = newSession
 		}
 		if err != nil {
-			p.session = nil
+			delete(p.sessions, model)
 			p.lastError = err.Error()
-		} else if waitingErr := waitingRoomErrorFromSession(p.name, session, time.Now()); waitingErr != nil {
+		} else if waitingErr := waitingRoomErrorFromSession(p.name, newSession, time.Now()); waitingErr != nil {
 			p.lastError = waitingErr.Error()
 		} else {
 			p.lastError = ""
 		}
-		close(p.sessionRefreshCh)
-		p.sessionRefreshCh = nil
+		close(p.sessionRefreshCh[model])
+		delete(p.sessionRefreshCh, model)
 		p.mu.Unlock()
 
 		if err == nil {
-			if waitingErr := waitingRoomErrorFromSession(p.name, session, time.Now()); waitingErr != nil {
+			if waitingErr := waitingRoomErrorFromSession(p.name, newSession, time.Now()); waitingErr != nil {
 				return "", waitingErr
 			}
 		}
@@ -99,43 +100,36 @@ func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
 	}
 }
 
-func (p *tokenPool) readySessionLocked(now time.Time) (string, bool) {
-	if p.session == nil {
+func (p *tokenPool) readySessionLocked(model string, now time.Time) (string, bool) {
+	session := p.sessions[model]
+	if session == nil {
 		return "", false
 	}
-	switch p.session.status {
+	switch session.status {
 	case sessionStatusDisabled:
 		return "", true
 	case sessionStatusActive:
-		if p.session.instanceID == "" {
+		if session.instanceID == "" {
 			return "", false
 		}
-		if p.session.expiresAt.IsZero() || now.Before(p.session.expiresAt.Add(-5*time.Second)) {
-			return p.session.instanceID, true
+		if session.expiresAt.IsZero() || now.Before(session.expiresAt.Add(-5*time.Second)) {
+			return session.instanceID, true
 		}
 	}
 	return "", false
 }
 
-func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string, error) {
-	p.mu.Lock()
-	current := p.session
-	p.mu.Unlock()
+func (p *tokenPool) refreshSession(ctx context.Context, model string) (*cachedSession, string, error) {
+	// End existing session before creating a new one for a different model.
+	// The upstream binds sessions to models; creating without ending reuses the old binding.
+	if err := p.client.EndSession(ctx, p.token); err != nil {
+		p.logger.Printf("%s: end session before refresh (continuing): %v", p.name, err)
+	}
 
-	var (
-		state freeSessionResponse
-		err   error
-	)
-	if current != nil && current.status == sessionStatusQueued && strings.TrimSpace(current.instanceID) != "" {
-		state, err = p.client.GetSession(ctx, p.token, current.instanceID)
-		if err != nil {
-			return nil, "", fmt.Errorf("poll free session: %w", err)
-		}
-	} else {
-		state, err = p.client.CreateOrRefreshSession(ctx, p.token)
-		if err != nil {
-			return nil, "", fmt.Errorf("start free session: %w", err)
-		}
+	// Pass the model so the upstream creates a session for the correct model
+	state, err := p.client.CreateOrRefreshSession(ctx, p.token, model)
+	if err != nil {
+		return nil, "", fmt.Errorf("start free session: %w", err)
 	}
 
 	for {
@@ -172,7 +166,7 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 				retryAfter: delay,
 			}, "", nil
 		case sessionStatusNone, sessionStatusEnded, sessionStatusSuperseded:
-			state, err = p.client.CreateOrRefreshSession(ctx, p.token)
+			state, err = p.client.CreateOrRefreshSession(ctx, p.token, model)
 			if err != nil {
 				return nil, "", fmt.Errorf("refresh free session: %w", err)
 			}
@@ -182,10 +176,10 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 	}
 }
 
-func (p *tokenPool) invalidateSession(reason string) {
+func (p *tokenPool) invalidateSession(model, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.session = nil
+	delete(p.sessions, model)
 	if reason != "" {
 		p.lastError = reason
 	}
@@ -194,10 +188,12 @@ func (p *tokenPool) invalidateSession(reason string) {
 func (p *tokenPool) currentSessionInstanceID() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.session == nil {
-		return ""
+	for _, session := range p.sessions {
+		if session != nil {
+			return session.instanceID
+		}
 	}
-	return p.session.instanceID
+	return ""
 }
 
 func waitingRoomErrorFromSession(token string, session *cachedSession, now time.Time) *waitingRoomError {
@@ -273,11 +269,17 @@ func formatElapsedDuration(d time.Duration) string {
 
 func (p *tokenPool) endSession(ctx context.Context) error {
 	p.mu.Lock()
-	session := p.session
-	p.session = nil
+	// End all active sessions
+	var activeSessions []*cachedSession
+	for _, session := range p.sessions {
+		if session != nil && session.status != sessionStatusDisabled && session.instanceID != "" {
+			activeSessions = append(activeSessions, session)
+		}
+	}
+	p.sessions = make(map[string]*cachedSession)
 	p.mu.Unlock()
 
-	if session == nil || session.status == sessionStatusDisabled || session.instanceID == "" {
+	if len(activeSessions) == 0 {
 		return nil
 	}
 	if err := p.client.EndSession(ctx, p.token); err != nil {
@@ -286,8 +288,8 @@ func (p *tokenPool) endSession(ctx context.Context) error {
 	return nil
 }
 
-func (c *UpstreamClient) CreateOrRefreshSession(ctx context.Context, authToken string) (freeSessionResponse, error) {
-	return c.doSessionRequest(ctx, http.MethodPost, authToken, "")
+func (c *UpstreamClient) CreateOrRefreshSession(ctx context.Context, authToken, model string) (freeSessionResponse, error) {
+	return c.doSessionRequestWithModel(ctx, http.MethodPost, authToken, "", model)
 }
 
 func (c *UpstreamClient) GetSession(ctx context.Context, authToken, instanceID string) (freeSessionResponse, error) {
@@ -325,6 +327,10 @@ func (c *UpstreamClient) EndSession(ctx context.Context, authToken string) error
 }
 
 func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken, instanceID string) (freeSessionResponse, error) {
+	return c.doSessionRequestWithModel(ctx, method, authToken, instanceID, "")
+}
+
+func (c *UpstreamClient) doSessionRequestWithModel(ctx context.Context, method, authToken, instanceID, model string) (freeSessionResponse, error) {
 	requestURL, err := url.JoinPath(c.baseURL, "/api/v1/freebuff/session")
 	if err != nil {
 		return freeSessionResponse{}, fmt.Errorf("build free session url: %w", err)
@@ -344,8 +350,11 @@ func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken
 	req.Header.Set("User-Agent", c.userAgent)
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
+		if model != "" {
+			req.Header.Set("x-freebuff-model", model)
+		}
 	}
-	if method == http.MethodGet && instanceID != "" {
+	if instanceID != "" {
 		req.Header.Set("x-freebuff-instance-id", instanceID)
 	}
 

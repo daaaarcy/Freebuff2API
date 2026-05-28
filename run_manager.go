@@ -31,8 +31,8 @@ type tokenPool struct {
 	mu               sync.Mutex
 	runs             map[string]*managedRun // agentID -> current run
 	draining         []*managedRun
-	session          *cachedSession
-	sessionRefreshCh chan struct{}
+	sessions         map[string]*cachedSession // model -> session
+	sessionRefreshCh map[string]chan struct{}   // model -> refresh channel
 	lastError        string
 	cooldownUntil    time.Time
 }
@@ -106,12 +106,14 @@ func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunM
 	pools := make([]*tokenPool, 0, len(cfg.AuthTokens))
 	for index, token := range cfg.AuthTokens {
 		pools = append(pools, &tokenPool{
-			name:   fmt.Sprintf("token-%d", index+1),
-			token:  token,
-			cfg:    cfg,
-			client: client,
-			runs:   make(map[string]*managedRun),
-			logger: logger,
+			name:             fmt.Sprintf("token-%d", index+1),
+			token:            token,
+			cfg:              cfg,
+			client:           client,
+			runs:             make(map[string]*managedRun),
+			sessions:         make(map[string]*cachedSession),
+			sessionRefreshCh: make(map[string]chan struct{}),
+			logger:           logger,
 		})
 	}
 
@@ -157,9 +159,6 @@ func (m *RunManager) prewarm(agentIDs []string) {
 	defer cancel()
 
 	for _, pool := range m.pools {
-		if _, err := pool.ensureSession(ctx); err != nil {
-			m.logger.Printf("%s: free session prewarm failed: %v", pool.name, err)
-		}
 		for _, agentID := range agentIDs {
 			if err := pool.rotateAgent(ctx, agentID); err != nil {
 				m.logger.Printf("%s: prewarm %s failed: %v", pool.name, agentID, err)
@@ -180,7 +179,7 @@ func (m *RunManager) Close(ctx context.Context) {
 	}
 }
 
-func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, error) {
+func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLease, error) {
 	if len(m.pools) == 0 {
 		return nil, errors.New("no auth tokens configured")
 	}
@@ -190,7 +189,7 @@ func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, er
 	var waiting []*waitingRoomError
 	for offset := 0; offset < len(m.pools); offset++ {
 		pool := m.pools[(startIndex+offset)%len(m.pools)]
-		lease, err := pool.acquire(ctx, agentID)
+		lease, err := pool.acquire(ctx, agentID, model)
 		if err == nil {
 			return lease, nil
 		}
@@ -245,7 +244,7 @@ func (m *RunManager) Snapshots() []tokenSnapshot {
 	return snapshots
 }
 
-func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, error) {
+func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLease, error) {
 	p.mu.Lock()
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
@@ -262,7 +261,7 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 		}
 	}
 
-	if _, err := p.ensureSession(ctx); err != nil {
+	if _, err := p.ensureSession(ctx, model); err != nil {
 		return nil, err
 	}
 
@@ -278,8 +277,17 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 }
 
 func (p *tokenPool) maintain(ctx context.Context) error {
-	if _, err := p.ensureSession(ctx); err != nil {
-		p.logger.Printf("%s: refresh free session failed: %v", p.name, err)
+	p.mu.Lock()
+	models := make([]string, 0, len(p.sessions))
+	for model := range p.sessions {
+		models = append(models, model)
+	}
+	p.mu.Unlock()
+
+	for _, model := range models {
+		if _, err := p.ensureSession(ctx, model); err != nil {
+			p.logger.Printf("%s: refresh free session for %s failed: %v", p.name, model, err)
+		}
 	}
 
 	p.mu.Lock()
@@ -468,13 +476,17 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 		CooldownUntil: p.cooldownUntil,
 		LastError:     p.lastError,
 	}
-	if p.session != nil {
-		snapshot.SessionStatus = string(p.session.status)
-		snapshot.SessionInstanceID = p.session.instanceID
-		snapshot.SessionExpiresAt = p.session.expiresAt
-		snapshot.SessionPosition = p.session.position
-		snapshot.SessionQueueDepth = p.session.queueDepth
-		snapshot.SessionPollAt = p.session.pollAt
+	// Show first active session for health display
+	for _, session := range p.sessions {
+		if session != nil {
+			snapshot.SessionStatus = string(session.status)
+			snapshot.SessionInstanceID = session.instanceID
+			snapshot.SessionExpiresAt = session.expiresAt
+			snapshot.SessionPosition = session.position
+			snapshot.SessionQueueDepth = session.queueDepth
+			snapshot.SessionPollAt = session.pollAt
+			break
+		}
 	}
 	for agentID, run := range p.runs {
 		snapshot.Runs = append(snapshot.Runs, runSnapshot{
