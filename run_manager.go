@@ -296,6 +296,10 @@ func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLea
 	}
 
 	if _, err := p.ensureSession(ctx, model); err != nil {
+		var rateErr *rateLimitError
+		if errors.As(err, &rateErr) && rateErr.RetryAfter > 0 {
+			p.markCooldown(rateErr.RetryAfter, fmt.Sprintf("rate limited for %s", model))
+		}
 		return nil, err
 	}
 
