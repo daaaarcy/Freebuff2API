@@ -7,7 +7,6 @@ import (
 	"log"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -15,7 +14,6 @@ type RunManager struct {
 	cfg    Config
 	logger *log.Logger
 	pools  []*tokenPool
-	next   atomic.Uint64
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -177,13 +175,14 @@ func (m *RunManager) prewarm(agentIDs []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
 	defer cancel()
 
-	for _, pool := range m.pools {
-		for _, agentID := range agentIDs {
-			if err := pool.rotateAgent(ctx, agentID); err != nil {
-				m.logger.Printf("%s: prewarm %s failed: %v", pool.name, agentID, err)
-			} else {
-				m.logger.Printf("%s: prewarmed %s", pool.name, agentID)
-			}
+	// Only prewarm the first pool. Backup pools activate on demand
+	// so we don't burn sessions on tokens that may not be needed.
+	pool := m.pools[0]
+	for _, agentID := range agentIDs {
+		if err := pool.rotateAgent(ctx, agentID); err != nil {
+			m.logger.Printf("%s: prewarm %s failed: %v", pool.name, agentID, err)
+		} else {
+			m.logger.Printf("%s: prewarmed %s", pool.name, agentID)
 		}
 	}
 }
@@ -203,47 +202,26 @@ func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLe
 		return nil, errors.New("no auth tokens configured")
 	}
 
-	startIndex := int(m.next.Add(1)-1) % len(m.pools)
+	// Failover: try pools in order, fall through on rate limit or cooldown.
 	var errs []string
-	var waiting []*waitingRoomError
-	var rateLimits []*rateLimitError
-	for offset := 0; offset < len(m.pools); offset++ {
-		pool := m.pools[(startIndex+offset)%len(m.pools)]
+	var lastRateErr *rateLimitError
+	for _, pool := range m.pools {
 		lease, err := pool.acquire(ctx, agentID, model)
 		if err == nil {
 			return lease, nil
 		}
-		var waitingErr *waitingRoomError
-		if errors.As(err, &waitingErr) {
-			waiting = append(waiting, waitingErr)
-		}
 		var rateErr *rateLimitError
 		if errors.As(err, &rateErr) {
-			rateLimits = append(rateLimits, rateErr)
+			lastRateErr = rateErr
+			errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
+			continue
 		}
+		// Cooldown or other transient errors — also try next pool.
 		errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
 	}
 
-	if len(waiting) == len(m.pools) && len(waiting) > 0 {
-		best := waiting[0]
-		for _, candidate := range waiting[1:] {
-			if candidate != nil && (best == nil || (candidate.Position > 0 && candidate.Position < best.Position)) {
-				best = candidate
-			}
-		}
-		if best != nil {
-			return nil, best
-		}
-	}
-
-	if len(rateLimits) > 0 {
-		best := rateLimits[0]
-		for _, rl := range rateLimits[1:] {
-			if !rl.ResetAt.IsZero() && (best.ResetAt.IsZero() || rl.ResetAt.Before(best.ResetAt)) {
-				best = rl
-			}
-		}
-		return nil, best
+	if lastRateErr != nil {
+		return nil, lastRateErr
 	}
 
 	return nil, fmt.Errorf("unable to acquire run from any token (%s)", strings.Join(errs, "; "))
