@@ -372,6 +372,9 @@ func (c *UpstreamClient) doSessionRequestWithModel(ctx context.Context, method, 
 	if err != nil {
 		return freeSessionResponse{}, fmt.Errorf("read free session response: %w", err)
 	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return freeSessionResponse{}, parseRateLimitError(responseBody)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return freeSessionResponse{}, fmt.Errorf("free session request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
 	}
@@ -384,6 +387,31 @@ func (c *UpstreamClient) doSessionRequestWithModel(ctx context.Context, method, 
 		return freeSessionResponse{}, fmt.Errorf("free session response missing status")
 	}
 	return parsed, nil
+}
+
+func parseRateLimitError(body []byte) *rateLimitError {
+	var parsed struct {
+		Model        string  `json:"model"`
+		ResetAt      string  `json:"resetAt"`
+		RetryAfterMs int64   `json:"retryAfterMs"`
+		Limit        float64 `json:"limit"`
+		RecentCount  float64 `json:"recentCount"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return &rateLimitError{}
+	}
+	rl := &rateLimitError{
+		Model:  parsed.Model,
+		Limit:  parsed.Limit,
+		Recent: parsed.RecentCount,
+	}
+	if parsed.ResetAt != "" {
+		rl.ResetAt, _ = time.Parse(time.RFC3339, parsed.ResetAt)
+	}
+	if parsed.RetryAfterMs > 0 {
+		rl.RetryAfter = time.Duration(parsed.RetryAfterMs) * time.Millisecond
+	}
+	return rl
 }
 
 func queuedPollDelay(state freeSessionResponse) time.Duration {

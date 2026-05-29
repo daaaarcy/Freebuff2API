@@ -275,6 +275,15 @@ func (s *Server) proxyChatRequest(
 				writeError(w, http.StatusServiceUnavailable, waitingErr.Error(), serverErrorType, "waiting_room_queued")
 				return
 			}
+			var rateErr *rateLimitError
+			if errors.As(err, &rateErr) {
+				msg := rateErr.Error()
+				if rateErr.RetryAfter > 0 {
+					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", rateErr.RetryAfter.Seconds()))
+				}
+				writeError(w, http.StatusTooManyRequests, msg, serverErrorType, "rate_limited")
+				return
+			}
 			writeError(w, http.StatusBadGateway, "no healthy upstream auth token available", serverErrorType, "")
 			return
 		}
@@ -290,6 +299,15 @@ func (s *Server) proxyChatRequest(
 					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", waitingErr.RetryAfter.Seconds()))
 				}
 				writeError(w, http.StatusServiceUnavailable, waitingErr.Error(), serverErrorType, "waiting_room_queued")
+				return
+			}
+			var rateErr *rateLimitError
+			if errors.As(err, &rateErr) {
+				msg := rateErr.Error()
+				if rateErr.RetryAfter > 0 {
+					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", rateErr.RetryAfter.Seconds()))
+				}
+				writeError(w, http.StatusTooManyRequests, msg, serverErrorType, "rate_limited")
 				return
 			}
 			writeError(w, http.StatusBadGateway, "failed to acquire upstream free session", serverErrorType, "")

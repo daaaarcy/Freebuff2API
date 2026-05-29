@@ -80,6 +80,25 @@ type waitingRoomError struct {
 	RetryAfter time.Duration
 }
 
+type rateLimitError struct {
+	Model     string
+	ResetAt   time.Time
+	RetryAfter time.Duration
+	Limit     float64
+	Recent    float64
+}
+
+func (e *rateLimitError) Error() string {
+	msg := fmt.Sprintf("rate limited for %s", e.Model)
+	if e.Limit > 0 {
+		msg += fmt.Sprintf(" (%.0f/%.0f used)", e.Recent, e.Limit)
+	}
+	if !e.ResetAt.IsZero() {
+		msg += fmt.Sprintf(", resets at %s", e.ResetAt.Format(time.RFC3339))
+	}
+	return msg
+}
+
 func (e *waitingRoomError) Error() string {
 	if e == nil {
 		return "freebuff waiting room queued"
@@ -187,6 +206,7 @@ func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLe
 	startIndex := int(m.next.Add(1)-1) % len(m.pools)
 	var errs []string
 	var waiting []*waitingRoomError
+	var rateLimits []*rateLimitError
 	for offset := 0; offset < len(m.pools); offset++ {
 		pool := m.pools[(startIndex+offset)%len(m.pools)]
 		lease, err := pool.acquire(ctx, agentID, model)
@@ -196,6 +216,10 @@ func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLe
 		var waitingErr *waitingRoomError
 		if errors.As(err, &waitingErr) {
 			waiting = append(waiting, waitingErr)
+		}
+		var rateErr *rateLimitError
+		if errors.As(err, &rateErr) {
+			rateLimits = append(rateLimits, rateErr)
 		}
 		errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
 	}
@@ -210,6 +234,16 @@ func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLe
 		if best != nil {
 			return nil, best
 		}
+	}
+
+	if len(rateLimits) > 0 {
+		best := rateLimits[0]
+		for _, rl := range rateLimits[1:] {
+			if !rl.ResetAt.IsZero() && (best.ResetAt.IsZero() || rl.ResetAt.Before(best.ResetAt)) {
+				best = rl
+			}
+		}
+		return nil, best
 	}
 
 	return nil, fmt.Errorf("unable to acquire run from any token (%s)", strings.Join(errs, "; "))
