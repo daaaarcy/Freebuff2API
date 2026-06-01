@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const freeSessionPollInterval = 5 * time.Second
+const (
+	freeSessionPollInterval        = 5 * time.Second
+	freeSessionRefreshSafetyWindow = 2 * time.Minute
+)
 
 type sessionStatus string
 
@@ -112,7 +115,7 @@ func (p *tokenPool) readySessionLocked(model string, now time.Time) (string, boo
 		if session.instanceID == "" {
 			return "", false
 		}
-		if session.expiresAt.IsZero() || now.Before(session.expiresAt.Add(-5*time.Second)) {
+		if session.expiresAt.IsZero() || now.Before(session.expiresAt.Add(-freeSessionRefreshSafetyWindow)) {
 			return session.instanceID, true
 		}
 	}

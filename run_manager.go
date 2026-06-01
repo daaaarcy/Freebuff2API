@@ -30,7 +30,7 @@ type tokenPool struct {
 	runs             map[string]*managedRun // agentID -> current run
 	draining         []*managedRun
 	sessions         map[string]*cachedSession // model -> session
-	sessionRefreshCh map[string]chan struct{}   // model -> refresh channel
+	sessionRefreshCh map[string]chan struct{}  // model -> refresh channel
 	lastError        string
 	cooldownUntil    time.Time
 }
@@ -79,11 +79,19 @@ type waitingRoomError struct {
 }
 
 type rateLimitError struct {
-	Model     string
-	ResetAt   time.Time
+	Model      string
+	ResetAt    time.Time
 	RetryAfter time.Duration
-	Limit     float64
-	Recent    float64
+	Limit      float64
+	Recent     float64
+}
+
+type cooldownError struct {
+	Until time.Time
+}
+
+func (e *cooldownError) Error() string {
+	return fmt.Sprintf("token cooling down until %s", e.Until.Format(time.RFC3339))
 }
 
 func (e *rateLimitError) Error() string {
@@ -197,22 +205,36 @@ func (m *RunManager) Close(ctx context.Context) {
 	}
 }
 
-func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLease, error) {
+func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLease, string, error) {
 	if len(m.pools) == 0 {
-		return nil, errors.New("no auth tokens configured")
+		return nil, "", errors.New("no auth tokens configured")
 	}
 
 	// Failover: try pools in order, fall through on rate limit or cooldown.
 	var errs []string
-	var lastRateErr *rateLimitError
+	var waiting []*waitingRoomError
+	var rateLimits []*rateLimitError
+	var cooldowns []*cooldownError
 	for _, pool := range m.pools {
-		lease, err := pool.acquire(ctx, agentID, model)
+		lease, sessionInstanceID, err := pool.acquire(ctx, agentID, model)
 		if err == nil {
-			return lease, nil
+			return lease, sessionInstanceID, nil
+		}
+		var waitingErr *waitingRoomError
+		if errors.As(err, &waitingErr) {
+			waiting = append(waiting, waitingErr)
+			errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
+			continue
+		}
+		var cooldownErr *cooldownError
+		if errors.As(err, &cooldownErr) {
+			cooldowns = append(cooldowns, cooldownErr)
+			errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
+			continue
 		}
 		var rateErr *rateLimitError
 		if errors.As(err, &rateErr) {
-			lastRateErr = rateErr
+			rateLimits = append(rateLimits, rateErr)
 			errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
 			continue
 		}
@@ -220,11 +242,16 @@ func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLe
 		errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
 	}
 
-	if lastRateErr != nil {
-		return nil, lastRateErr
+	transitionErrors := len(waiting) + len(rateLimits) + len(cooldowns)
+	if len(waiting) > 0 && transitionErrors == len(m.pools) {
+		return nil, "", bestWaitingRoomError(waiting)
 	}
 
-	return nil, fmt.Errorf("unable to acquire run from any token (%s)", strings.Join(errs, "; "))
+	if len(rateLimits) > 0 && transitionErrors == len(m.pools) {
+		return nil, "", bestRateLimitError(rateLimits)
+	}
+
+	return nil, "", fmt.Errorf("unable to acquire run from any token (%s)", strings.Join(errs, "; "))
 }
 
 func (m *RunManager) Release(lease *runLease) {
@@ -256,12 +283,12 @@ func (m *RunManager) Snapshots() []tokenSnapshot {
 	return snapshots
 }
 
-func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLease, error) {
+func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLease, string, error) {
 	p.mu.Lock()
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
 		p.mu.Unlock()
-		return nil, fmt.Errorf("token cooling down until %s", cooldownUntil.Format(time.RFC3339))
+		return nil, "", &cooldownError{Until: cooldownUntil}
 	}
 	run := p.runs[agentID]
 	needsRotate := run == nil || time.Since(run.startedAt) >= p.cfg.RotationInterval
@@ -269,27 +296,76 @@ func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLea
 
 	if needsRotate {
 		if err := p.rotateAgent(ctx, agentID); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	}
 
-	if _, err := p.ensureSession(ctx, model); err != nil {
+	sessionInstanceID, err := p.ensureSession(ctx, model)
+	if err != nil {
 		var rateErr *rateLimitError
 		if errors.As(err, &rateErr) && rateErr.RetryAfter > 0 {
 			p.markCooldown(rateErr.RetryAfter, fmt.Sprintf("rate limited for %s", model))
 		}
-		return nil, err
+		return nil, "", err
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	run = p.runs[agentID]
 	if run == nil {
-		return nil, errors.New("run missing after rotation")
+		return nil, "", errors.New("run missing after rotation")
 	}
 	run.inflight++
 	run.requestCount++
-	return &runLease{pool: p, run: run}, nil
+	return &runLease{pool: p, run: run}, sessionInstanceID, nil
+}
+
+func bestWaitingRoomError(waiting []*waitingRoomError) *waitingRoomError {
+	if len(waiting) == 0 {
+		return nil
+	}
+	best := waiting[0]
+	for _, candidate := range waiting[1:] {
+		if candidate == nil {
+			continue
+		}
+		if best == nil {
+			best = candidate
+			continue
+		}
+		if candidate.Position > 0 && (best.Position == 0 || candidate.Position < best.Position) {
+			best = candidate
+			continue
+		}
+		if candidate.Position == best.Position && candidate.RetryAfter > 0 && (best.RetryAfter == 0 || candidate.RetryAfter < best.RetryAfter) {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func bestRateLimitError(rateLimits []*rateLimitError) *rateLimitError {
+	if len(rateLimits) == 0 {
+		return nil
+	}
+	best := rateLimits[0]
+	for _, candidate := range rateLimits[1:] {
+		if candidate == nil {
+			continue
+		}
+		if best == nil {
+			best = candidate
+			continue
+		}
+		if !candidate.ResetAt.IsZero() && (best.ResetAt.IsZero() || candidate.ResetAt.Before(best.ResetAt)) {
+			best = candidate
+			continue
+		}
+		if candidate.ResetAt.Equal(best.ResetAt) && candidate.RetryAfter > 0 && (best.RetryAfter == 0 || candidate.RetryAfter < best.RetryAfter) {
+			best = candidate
+		}
+	}
+	return best
 }
 
 func (p *tokenPool) maintain(ctx context.Context) error {
@@ -361,7 +437,7 @@ func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
 		p.mu.Unlock()
-		return fmt.Errorf("token cooling down until %s", cooldownUntil.Format(time.RFC3339))
+		return &cooldownError{Until: cooldownUntil}
 	}
 	p.mu.Unlock()
 

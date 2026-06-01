@@ -264,8 +264,10 @@ func (s *Server) proxyChatRequest(
 		return
 	}
 
-	for attempt := 0; attempt < 2; attempt++ {
-		lease, err := s.runs.Acquire(r.Context(), agentID, requestedModel)
+	maxAttempts := maxInt(len(s.runs.pools)*2, 2)
+	var lastRateErr *rateLimitError
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		lease, sessionInstanceID, err := s.runs.Acquire(r.Context(), agentID, requestedModel)
 		if err != nil {
 			var waitingErr *waitingRoomError
 			if errors.As(err, &waitingErr) {
@@ -282,6 +284,13 @@ func (s *Server) proxyChatRequest(
 					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", rateErr.RetryAfter.Seconds()))
 				}
 				writeError(w, http.StatusTooManyRequests, msg, serverErrorType, "rate_limited")
+				return
+			}
+			if lastRateErr != nil {
+				if lastRateErr.RetryAfter > 0 {
+					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", lastRateErr.RetryAfter.Seconds()))
+				}
+				writeError(w, http.StatusTooManyRequests, lastRateErr.Error(), serverErrorType, "rate_limited")
 				return
 			}
 			writeError(w, http.StatusBadGateway, "no healthy upstream auth token available", serverErrorType, "")
@@ -289,30 +298,6 @@ func (s *Server) proxyChatRequest(
 		}
 
 		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.name, requestedModel, lease.run.id)
-
-		sessionInstanceID, err := lease.pool.ensureSession(r.Context(), requestedModel)
-		if err != nil {
-			s.runs.Release(lease)
-			var waitingErr *waitingRoomError
-			if errors.As(err, &waitingErr) {
-				if waitingErr.RetryAfter > 0 {
-					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", waitingErr.RetryAfter.Seconds()))
-				}
-				writeError(w, http.StatusServiceUnavailable, waitingErr.Error(), serverErrorType, "waiting_room_queued")
-				return
-			}
-			var rateErr *rateLimitError
-			if errors.As(err, &rateErr) {
-				msg := rateErr.Error()
-				if rateErr.RetryAfter > 0 {
-					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", rateErr.RetryAfter.Seconds()))
-				}
-				writeError(w, http.StatusTooManyRequests, msg, serverErrorType, "rate_limited")
-				return
-			}
-			writeError(w, http.StatusBadGateway, "failed to acquire upstream free session", serverErrorType, "")
-			return
-		}
 
 		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, sessionInstanceID)
 		if err != nil {
@@ -352,12 +337,29 @@ func (s *Server) proxyChatRequest(
 			continue
 		}
 
-		s.logger.Printf("[%s] upstream error (attempt %d, status=%d): %s", lease.pool.name, attempt, resp.StatusCode, strings.TrimSpace(string(errorBody)))
+		if resp.StatusCode == http.StatusTooManyRequests {
+			rateErr := rateLimitErrorFromResponse(resp, errorBody, requestedModel)
+			lastRateErr = rateErr
+			cooldown := rateErr.RetryAfter
+			if cooldown <= 0 {
+				cooldown = 30 * time.Minute
+			}
+			s.runs.Cooldown(lease, cooldown, rateErr.Error())
+			lease.pool.invalidateSession(requestedModel, rateErr.Error())
+			s.runs.Release(lease)
+			s.logger.Printf("%s: upstream rate limited token, cooling down for %s and retrying next token", lease.pool.name, cooldown.Round(time.Second))
+			continue
+		}
 
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.runs.Cooldown(lease, 30*time.Minute, "upstream auth rejected token")
 			lease.pool.invalidateSession(requestedModel, "upstream auth rejected token")
+			s.runs.Release(lease)
+			s.logger.Printf("%s: upstream auth rejected token, cooling down and retrying next token", lease.pool.name)
+			continue
 		}
+
+		s.logger.Printf("[%s] upstream error (attempt %d, status=%d): %s", lease.pool.name, attempt, resp.StatusCode, strings.TrimSpace(string(errorBody)))
 
 		s.runs.Release(lease)
 		s.logger.Printf("[%s] upstream error response: %s", lease.pool.name, string(errorBody))
@@ -365,7 +367,14 @@ func (s *Server) proxyChatRequest(
 		return
 	}
 
-	writeError(w, http.StatusBadGateway, "upstream run expired twice in a row", serverErrorType, "")
+	if lastRateErr != nil {
+		if lastRateErr.RetryAfter > 0 {
+			w.Header().Set("Retry-After", fmt.Sprintf("%.0f", lastRateErr.RetryAfter.Seconds()))
+		}
+		writeError(w, http.StatusTooManyRequests, lastRateErr.Error(), serverErrorType, "rate_limited")
+		return
+	}
+	writeError(w, http.StatusBadGateway, "upstream transition failed after retrying available auth tokens", serverErrorType, "")
 }
 
 func writeOpenAISuccessResponse(w http.ResponseWriter, resp *http.Response) error {
@@ -420,6 +429,23 @@ func isSessionInvalid(statusCode int, errorBody []byte) bool {
 	default:
 		return false
 	}
+}
+
+func rateLimitErrorFromResponse(resp *http.Response, body []byte, requestedModel string) *rateLimitError {
+	rateErr := parseRateLimitError(body)
+	if strings.TrimSpace(rateErr.Model) == "" {
+		rateErr.Model = requestedModel
+	}
+	if rateErr.RetryAfter <= 0 {
+		rateErr.RetryAfter = retryAfterDuration(resp.Header.Get("Retry-After"))
+	}
+	if rateErr.RetryAfter <= 0 && !rateErr.ResetAt.IsZero() {
+		rateErr.RetryAfter = time.Until(rateErr.ResetAt)
+	}
+	if rateErr.RetryAfter < 0 {
+		rateErr.RetryAfter = 0
+	}
+	return rateErr
 }
 
 // normalizeToolSchemas rewrites tool parameter schemas into a conservative JSON
