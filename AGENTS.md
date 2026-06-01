@@ -27,10 +27,10 @@ Server (server.go) ── API key auth middleware
   ▼
 proxyChatRequest
   ├── ModelRegistry.AgentForModel() → resolve agentID
-  ├── RunManager.Acquire()          → select pool, rotate run, ensure session
-  ├── injectUpstreamMetadata        → run_id, cost_mode, client_id, instance_id
+  ├── RunManager.Acquire()          → select pool, rotate run, ensure session, return instance_id
+  ├── injectUpstreamMetadata        → run_id, cost_mode, client_id, returned instance_id
   ├── UpstreamClient.ChatCompletions() → POST /api/v1/chat/completions
-  └── Handle response: stream/retry on session/run invalidity
+  └── Handle response: stream/retry on session/run invalidity, 401, 429
   │
   ▼
 Upstream (www.codebuff.com)
@@ -52,6 +52,7 @@ Upstream (www.codebuff.com)
 | `server.go` | HTTP handlers, middleware, proxy logic, tool schema normalization, error formatting |
 | `anthropic.go` | Claude↔OpenAI bidirectional format conversion (streaming + non-streaming) |
 | `token_count.go` | Token counting via tiktoken for `/v1/messages/count_tokens` |
+| `*_test.go` | Regression tests for session expiry, waiting-room/rate-limit aggregation, and auth-token failover |
 
 ## Configuration
 
@@ -78,11 +79,16 @@ One `tokenPool` per `AUTH_TOKEN`. **Sequential failover, not round-robin:**
 1. **Only pool 0 (token-1) prewarms** on startup — creates runs for all 16 agents
 2. **Backup pools stay idle** — no runs, no sessions, until needed
 3. **Requests always try pool 0 first** — if it succeeds, done
-4. **On rate limit (429)** — pool enters cooldown until `resetAt`, try next pool
-5. **On cooldown (401, etc.)** — skip pool, try next
+4. **On session acquisition 429** — pool enters cooldown until `resetAt`/`Retry-After`, try next pool
+5. **On chat 429 or 401** — active token is cooled down, session is invalidated, request retries through next pool before returning an error
 6. **Backups activate lazily** — first request on a backup pool creates its run and session on demand
 
 This ensures at most one token has an active premium session at any time, preserving the 1h session quota across tokens.
+
+When every token is unavailable, `RunManager.Acquire()` preserves the most useful client-facing transition error:
+- all available tokens queued → best `waitingRoomError` by queue position/retry delay
+- all available tokens rate-limited → best `rateLimitError` by earliest reset/retry delay
+- cooldown-only or mixed unknown failures → generic 502 with per-token details in logs/error text
 
 ## Key Error Types
 
@@ -115,6 +121,10 @@ Falls back to `hardcodedFallback` map if upstream fetch fails.
 Sessions are **per-pool, per-model** (`sessions map[model]*cachedSession`).
 
 Lifecycle: `ensureSession()` → check cache → `refreshSession()` → POST `/api/v1/freebuff/session` → poll until active → cache with expiry.
+
+`RunManager.Acquire()` calls `ensureSession()` before leasing the run and returns the selected session instance ID to `proxyChatRequest`; handlers should not call `ensureSession()` a second time for the same request.
+
+Active sessions are treated as stale inside the final 2 minutes before `expiresAt` (`freeSessionRefreshSafetyWindow`) so normal requests refresh before hitting upstream `session_expired`.
 
 Model switching requires ending the current session first (upstream binds sessions to models).
 
@@ -177,15 +187,14 @@ Use this to diagnose 502s — check `last_error` and `cooldown_until` on each po
 ```bash
 go build -o freebuff2api .          # build
 go vet ./...                        # lint
+go test -count=1 ./...              # tests
 ./freebuff2api -config config.json  # run locally
 ```
-
-No test files exist in this project.
 
 ## Common Gotchas
 
 - **429 rate limits** are per-model, per-token, daily quota (resets midnight Pacific / ~3pm SGT)
-- **Sessions expire** after 1h — the maintenance loop refreshes them, but model switching requires explicit session end
+- **Sessions expire** after 1h — cached sessions refresh 2 minutes before expiry, but long streams can still cross the upstream expiry boundary after response bytes are already sent
 - **Prewarm only warms pool 0** — backup pools have no runs until first failover, expect slight latency on first backup request
 - **Invalid tokens** (logged out) cause 404 on StartRun — remove from config or re-login
 - **Model registry** fetches from GitHub — if fetch fails, hardcoded fallback is used (may be stale)
