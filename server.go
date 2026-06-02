@@ -340,6 +340,7 @@ func (s *Server) proxyChatRequest(
 			writeError(w, http.StatusBadRequest, err.Error(), invalidRequestType, "")
 			return
 		}
+		s.logger.Printf("[%s] Upstream request detail (attempt %d/%d): %s", lease.pool.name, attempt+1, maxAttempts, requestDetailForLog(upstreamBody))
 
 		resp, errorBody, err := s.client.ChatCompletions(r.Context(), lease.pool.token, upstreamBody)
 		if err != nil {
@@ -493,6 +494,7 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 	if len(retryInstructions) > 0 {
 		prependSystemInstruction(cloned, retryInstructions[0])
 	}
+	normalizeDeepSeekThinkingControls(cloned, requestedModel)
 
 	metadata, ok := cloned["codebuff_metadata"].(map[string]any)
 	if !ok || metadata == nil {
@@ -513,6 +515,42 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 	return body, nil
 }
 
+func normalizeDeepSeekThinkingControls(payload map[string]any, requestedModel string) {
+	if !isDeepSeekModel(requestedModel) {
+		return
+	}
+	thinking := mapValue(payload["thinking"])
+	extraBody := mapValue(payload["extra_body"])
+	extraBodyThinking := mapValue(extraBody["thinking"])
+	if thinking == nil && extraBodyThinking != nil {
+		thinking = extraBodyThinking
+		payload["thinking"] = thinking
+	}
+	if thinking == nil {
+		return
+	}
+	if effort := strings.TrimSpace(stringValue(payload["reasoning_effort"])); effort != "" && strings.TrimSpace(stringValue(thinking["reasoning_effort"])) == "" {
+		thinking["reasoning_effort"] = effort
+	}
+	delete(payload, "reasoning")
+	delete(payload, "reasoning_effort")
+	if extraBody != nil {
+		delete(extraBody, "thinking")
+		if len(extraBody) == 0 {
+			delete(payload, "extra_body")
+		}
+	}
+}
+
+func isDeepSeekModel(model string) bool {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "deepseek/deepseek-v4-pro", "deepseek-v4-pro", "deepseek/deepseek-v4-flash", "deepseek-v4-flash":
+		return true
+	default:
+		return false
+	}
+}
+
 func prependSystemInstruction(payload map[string]any, instruction string) {
 	instruction = strings.TrimSpace(instruction)
 	if instruction == "" {
@@ -531,6 +569,68 @@ func prependSystemInstruction(payload map[string]any, instruction string) {
 	withInstruction = append(withInstruction, systemMessage)
 	withInstruction = append(withInstruction, messages...)
 	payload["messages"] = withInstruction
+}
+
+const maxRequestDetailLogChars = 32 * 1024
+
+func requestDetailForLog(body []byte) string {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return truncateRequestDetailForLog(strings.TrimSpace(string(body)))
+	}
+	sanitized := sanitizeLogValue(payload)
+	encoded := compactJSONValue(sanitized)
+	if encoded == "" {
+		return "{}"
+	}
+	return truncateRequestDetailForLog(encoded)
+}
+
+func sanitizeLogValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		output := make(map[string]any, len(typed))
+		for key, child := range typed {
+			if shouldOmitLogKey(key) {
+				continue
+			}
+			if shouldRedactLogKey(key) {
+				output[key] = "[redacted]"
+				continue
+			}
+			output[key] = sanitizeLogValue(child)
+		}
+		return output
+	case []any:
+		output := make([]any, len(typed))
+		for index, child := range typed {
+			output[index] = sanitizeLogValue(child)
+		}
+		return output
+	default:
+		return value
+	}
+}
+
+func shouldOmitLogKey(key string) bool {
+	return strings.EqualFold(strings.TrimSpace(key), "codebuff_metadata")
+}
+
+func shouldRedactLogKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "authorization", "api_key", "apikey", "api_keys", "auth_token", "auth_tokens", "access_token", "refresh_token", "password", "secret", "token", "tokens":
+		return true
+	default:
+		return false
+	}
+}
+
+func truncateRequestDetailForLog(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= maxRequestDetailLogChars {
+		return value
+	}
+	return value[:maxRequestDetailLogChars] + "...(truncated)"
 }
 
 func isSessionInvalid(statusCode int, errorBody []byte) bool {

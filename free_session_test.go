@@ -46,7 +46,7 @@ func TestEnsureSessionRejectsRefreshWhilePremiumSessionInflight(t *testing.T) {
 	}
 }
 
-func TestEnsureSessionReusesPremiumSessionForFlashWhileInflight(t *testing.T) {
+func TestEnsureSessionRejectsMismatchedFlashWhilePremiumSessionInflight(t *testing.T) {
 	pool := &tokenPool{
 		name: "token-1",
 		session: &cachedSession{
@@ -59,11 +59,12 @@ func TestEnsureSessionReusesPremiumSessionForFlashWhileInflight(t *testing.T) {
 	}
 
 	instanceID, err := pool.ensureSession(context.Background(), "deepseek/deepseek-v4-flash")
-	if err != nil {
-		t.Fatalf("ensure flash session: %v", err)
+	if instanceID != "" {
+		t.Fatalf("instanceID = %q, want empty for mismatched in-flight pro session", instanceID)
 	}
-	if instanceID != "session-pro" {
-		t.Fatalf("instanceID = %q, want existing pro session for flash", instanceID)
+	var lockedErr *sessionModelLockedError
+	if !errors.As(err, &lockedErr) {
+		t.Fatalf("err = %v, want sessionModelLockedError", err)
 	}
 }
 

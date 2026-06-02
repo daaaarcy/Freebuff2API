@@ -232,6 +232,10 @@ func activeSessionResponse(token string) freeSessionResponse {
 }
 
 func newTransitionServer(baseURL string, tokens []string) *Server {
+	return newTransitionServerWithLogger(baseURL, tokens, log.New(io.Discard, "", 0))
+}
+
+func newTransitionServerWithLogger(baseURL string, tokens []string, logger *log.Logger) *Server {
 	cfg := Config{
 		UpstreamBaseURL:  baseURL,
 		AuthTokens:       tokens,
@@ -239,7 +243,6 @@ func newTransitionServer(baseURL string, tokens []string) *Server {
 		RequestTimeout:   5 * time.Second,
 		UserAgent:        "freebuff-transition-test",
 	}
-	logger := log.New(io.Discard, "", 0)
 	client := NewUpstreamClient(cfg)
 	registry := &ModelRegistry{
 		agentModels: map[string][]string{
@@ -335,9 +338,9 @@ func TestProxySharesOneSessionAcrossSamePremiumModelRequests(t *testing.T) {
 	}
 }
 
-func TestFlashReusesExistingPremiumSessionWithoutStartingNewSession(t *testing.T) {
+func TestFlashSkipsTokenWithExistingPremiumSession(t *testing.T) {
 	upstream, upstreamServer := newTransitionUpstream(t)
-	server := newTransitionServer(upstreamServer.URL, []string{"token-1"})
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1", "token-2"})
 
 	pro := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)
 	if pro.Code != http.StatusOK {
@@ -348,11 +351,14 @@ func TestFlashReusesExistingPremiumSessionWithoutStartingNewSession(t *testing.T
 		t.Fatalf("flash status = %d, body = %s, want 200", flash.Code, flash.Body.String())
 	}
 
-	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1"; got != want {
-		t.Fatalf("session requests = %s, want flash to reuse existing pro session", got)
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1,token-2"; got != want {
+		t.Fatalf("session requests = %s, want flash to skip token-1 pro session and start token-2", got)
 	}
-	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-session,token-1-session"; got != want {
-		t.Fatalf("chat session IDs = %s, want shared pro session for flash", got)
+	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1,token-2"; got != want {
+		t.Fatalf("chat tokens = %s, want pro on token-1 and flash on token-2", got)
+	}
+	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-session,token-2-session"; got != want {
+		t.Fatalf("chat session IDs = %s, want separate pro and flash sessions", got)
 	}
 
 	snapshots := server.runs.Snapshots()
@@ -362,12 +368,15 @@ func TestFlashReusesExistingPremiumSessionWithoutStartingNewSession(t *testing.T
 	if got := snapshots[0].SessionStartedCounts[transitionTestModel]; got != 1 {
 		t.Fatalf("pro session starts = %d, want 1", got)
 	}
-	if got := snapshots[0].SessionStartedCounts[transitionFlashModel]; got != 0 {
-		t.Fatalf("flash session starts = %d, want 0 when reusing pro session", got)
+	if got := snapshots[1].SessionModel; got != transitionFlashModel {
+		t.Fatalf("token-2 session model = %q, want flash model", got)
+	}
+	if got := snapshots[1].SessionStartedCounts[transitionFlashModel]; got != 1 {
+		t.Fatalf("flash session starts = %d, want 1 on token-2", got)
 	}
 }
 
-func TestFlashReusesPremiumSessionWhilePremiumRequestInflight(t *testing.T) {
+func TestFlashSkipsTokenWithInflightPremiumSession(t *testing.T) {
 	upstream, upstreamServer := newTransitionUpstream(t)
 	server := newTransitionServer(upstreamServer.URL, []string{"token-1", "token-2"})
 
@@ -381,14 +390,14 @@ func TestFlashReusesPremiumSessionWhilePremiumRequestInflight(t *testing.T) {
 	if flash.Code != http.StatusOK {
 		t.Fatalf("flash status = %d, body = %s, want 200", flash.Code, flash.Body.String())
 	}
-	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1"; got != want {
-		t.Fatalf("session requests = %s, want flash to reuse in-flight pro session", got)
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1,token-2"; got != want {
+		t.Fatalf("session requests = %s, want flash to skip in-flight pro session and start token-2", got)
 	}
-	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1"; got != want {
-		t.Fatalf("chat tokens = %s, want flash to stay on token-1", got)
+	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-2"; got != want {
+		t.Fatalf("chat tokens = %s, want flash to use token-2", got)
 	}
-	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-session"; got != want {
-		t.Fatalf("chat session IDs = %s, want pro session reused for flash", got)
+	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-2-session"; got != want {
+		t.Fatalf("chat session IDs = %s, want token-2 flash session", got)
 	}
 }
 
@@ -662,6 +671,150 @@ func TestInjectUpstreamMetadataPreservesJSONObjectResponseFormat(t *testing.T) {
 	content := stringValue(systemMessage["content"])
 	if !strings.Contains(content, "valid JSON object") || strings.Contains(content, "schema") {
 		t.Fatalf("system instruction = %q, want plain JSON object instruction", content)
+	}
+}
+
+func TestInjectUpstreamMetadataPreservesExplicitDeepSeekThinking(t *testing.T) {
+	server := newTransitionServer("http://example.invalid", []string{"token-1"})
+	payload := map[string]any{
+		"model":    transitionTestModel,
+		"messages": []any{map[string]any{"role": "user", "content": "return json"}},
+		"thinking": map[string]any{"type": "disabled"},
+		"reasoning": map[string]any{
+			"enabled": true,
+			"effort":  "high",
+		},
+		"reasoning_effort": "high",
+	}
+
+	body, err := server.injectUpstreamMetadata(payload, transitionTestModel, "run-1", "session-1")
+	if err != nil {
+		t.Fatalf("inject metadata: %v", err)
+	}
+
+	var forwarded map[string]any
+	if err := json.Unmarshal(body, &forwarded); err != nil {
+		t.Fatalf("decode forwarded body: %v", err)
+	}
+	thinking := mapValue(forwarded["thinking"])
+	if got := stringValue(thinking["type"]); got != "disabled" {
+		t.Fatalf("forwarded thinking.type = %q, want disabled", got)
+	}
+	if got := stringValue(thinking["reasoning_effort"]); got != "high" {
+		t.Fatalf("forwarded thinking.reasoning_effort = %q, want high", got)
+	}
+	if _, exists := forwarded["reasoning_effort"]; exists {
+		t.Fatalf("forwarded reasoning_effort = %#v, want folded into thinking", forwarded["reasoning_effort"])
+	}
+	if _, exists := forwarded["reasoning"]; exists {
+		t.Fatalf("forwarded reasoning = %#v, want omitted so Codebuff preserves explicit thinking", forwarded["reasoning"])
+	}
+	if originalThinking := mapValue(payload["thinking"]); stringValue(originalThinking["reasoning_effort"]) != "" {
+		t.Fatalf("original thinking mutated: %#v", payload["thinking"])
+	}
+}
+
+func TestInjectUpstreamMetadataHoistsExtraBodyDeepSeekThinking(t *testing.T) {
+	server := newTransitionServer("http://example.invalid", []string{"token-1"})
+	payload := map[string]any{
+		"model":    transitionTestModel,
+		"messages": []any{map[string]any{"role": "user", "content": "return json"}},
+		"extra_body": map[string]any{
+			"thinking": map[string]any{"type": "disabled"},
+		},
+		"reasoning": map[string]any{
+			"enabled": true,
+			"effort":  "high",
+		},
+		"reasoning_effort": "high",
+	}
+
+	body, err := server.injectUpstreamMetadata(payload, transitionTestModel, "run-1", "session-1")
+	if err != nil {
+		t.Fatalf("inject metadata: %v", err)
+	}
+
+	var forwarded map[string]any
+	if err := json.Unmarshal(body, &forwarded); err != nil {
+		t.Fatalf("decode forwarded body: %v", err)
+	}
+	thinking := mapValue(forwarded["thinking"])
+	if got := stringValue(thinking["type"]); got != "disabled" {
+		t.Fatalf("forwarded thinking.type = %q, want disabled", got)
+	}
+	if got := stringValue(thinking["reasoning_effort"]); got != "high" {
+		t.Fatalf("forwarded thinking.reasoning_effort = %q, want high", got)
+	}
+	if extraBody := mapValue(forwarded["extra_body"]); extraBody != nil {
+		if _, exists := extraBody["thinking"]; exists {
+			t.Fatalf("forwarded extra_body.thinking = %#v, want hoisted to top-level thinking", extraBody["thinking"])
+		}
+	}
+	if _, exists := forwarded["reasoning_effort"]; exists {
+		t.Fatalf("forwarded reasoning_effort = %#v, want folded into thinking", forwarded["reasoning_effort"])
+	}
+	if _, exists := forwarded["reasoning"]; exists {
+		t.Fatalf("forwarded reasoning = %#v, want omitted so Codebuff preserves explicit thinking", forwarded["reasoning"])
+	}
+	if originalThinking := mapValue(mapValue(payload["extra_body"])["thinking"]); stringValue(originalThinking["reasoning_effort"]) != "" {
+		t.Fatalf("original extra_body.thinking mutated: %#v", mapValue(payload["extra_body"])["thinking"])
+	}
+}
+
+func TestInjectUpstreamMetadataDoesNotNormalizeThinkingForNonDeepSeek(t *testing.T) {
+	server := newTransitionServer("http://example.invalid", []string{"token-1"})
+	payload := map[string]any{
+		"model":            transitionKimiModel,
+		"messages":         []any{map[string]any{"role": "user", "content": "return json"}},
+		"thinking":         map[string]any{"type": "disabled"},
+		"reasoning_effort": "high",
+	}
+
+	body, err := server.injectUpstreamMetadata(payload, transitionKimiModel, "run-1", "session-1")
+	if err != nil {
+		t.Fatalf("inject metadata: %v", err)
+	}
+
+	var forwarded map[string]any
+	if err := json.Unmarshal(body, &forwarded); err != nil {
+		t.Fatalf("decode forwarded body: %v", err)
+	}
+	if got := stringValue(mapValue(forwarded["thinking"])["type"]); got != "disabled" {
+		t.Fatalf("forwarded thinking.type = %q, want disabled", got)
+	}
+	if got := stringValue(forwarded["reasoning_effort"]); got != "high" {
+		t.Fatalf("forwarded reasoning_effort = %q, want high", got)
+	}
+}
+
+func TestProxyLogsDetailedUpstreamRequestMessages(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	upstream.chatStatuses["token-1"] = []upstreamError{
+		{status: http.StatusOK, body: `{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"{\"ok\":true}"},"finish_reason":"stop"}]}`},
+	}
+	var logs bytes.Buffer
+	server := newTransitionServerWithLogger(upstreamServer.URL, []string{"token-1"}, log.New(&logs, "", 0))
+
+	recorder := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"diagnose strict schema failure"}],"response_format":{"type":"json_schema","json_schema":{"name":"debug_response","strict":true,"schema":{"type":"object","additionalProperties":false,"required":["ok"],"properties":{"ok":{"type":"boolean"}}}}}}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200", recorder.Code, recorder.Body.String())
+	}
+
+	logText := logs.String()
+	if !strings.Contains(logText, "Upstream request detail") {
+		t.Fatalf("logs = %s, want upstream request detail", logText)
+	}
+	if !strings.Contains(logText, "deepseek/deepseek-v4-pro") {
+		t.Fatalf("logs = %s, want requested model", logText)
+	}
+	if !strings.Contains(logText, "diagnose strict schema failure") {
+		t.Fatalf("logs = %s, want request message content", logText)
+	}
+	if !strings.Contains(logText, "Return exactly one valid JSON object matching this JSON schema") {
+		t.Fatalf("logs = %s, want injected response_format system instruction", logText)
+	}
+	if strings.Contains(logText, "codebuff_metadata") || strings.Contains(logText, "freebuff_instance_id") {
+		t.Fatalf("logs = %s, want internal metadata omitted from request detail", logText)
 	}
 }
 

@@ -72,6 +72,27 @@ func (e *sessionBusyError) Error() string {
 	return message
 }
 
+type sessionModelLockedError struct {
+	Token          string
+	CurrentModel   string
+	RequestedModel string
+	ExpiresAt      time.Time
+}
+
+func (e *sessionModelLockedError) Error() string {
+	message := "free session is locked to a different model"
+	if e.Token != "" {
+		message += " for " + e.Token
+	}
+	if e.CurrentModel != "" || e.RequestedModel != "" {
+		message += fmt.Sprintf(" (current %s, requested %s)", e.CurrentModel, e.RequestedModel)
+	}
+	if !e.ExpiresAt.IsZero() {
+		message += fmt.Sprintf(", expires at %s", e.ExpiresAt.Format(time.RFC3339))
+	}
+	return message
+}
+
 func (p *tokenPool) ensureSession(ctx context.Context, model string) (string, error) {
 	for {
 		p.mu.Lock()
@@ -84,6 +105,16 @@ func (p *tokenPool) ensureSession(ctx context.Context, model string) (string, er
 		if instanceID, ready := p.readySessionLocked(model, time.Now()); ready {
 			p.mu.Unlock()
 			return instanceID, nil
+		}
+		if sessionModelMismatch(session, model) && session != nil && session.status == sessionStatusActive && session.instanceID != "" && (session.expiresAt.IsZero() || time.Now().Before(session.expiresAt)) {
+			err := &sessionModelLockedError{
+				Token:          p.name,
+				CurrentModel:   strings.TrimSpace(session.model),
+				RequestedModel: strings.TrimSpace(model),
+				ExpiresAt:      session.expiresAt,
+			}
+			p.mu.Unlock()
+			return "", err
 		}
 		if waitingErr := waitingRoomErrorFromSession(p.name, session, time.Now()); waitingErr != nil {
 			p.mu.Unlock()
@@ -150,9 +181,6 @@ func (p *tokenPool) readySessionLocked(model string, now time.Time) (string, boo
 			return "", false
 		}
 		if sessionModelMismatch(session, model) {
-			if !p.cfg.RequiresPremiumSession(model) && (session.expiresAt.IsZero() || now.Before(session.expiresAt)) {
-				return session.instanceID, true
-			}
 			return "", false
 		}
 		if session.expiresAt.IsZero() || now.Before(session.expiresAt.Add(-freeSessionRefreshSafetyWindow)) {

@@ -64,7 +64,7 @@ Upstream (www.codebuff.com)
   "UPSTREAM_BASE_URL": "https://www.codebuff.com",
   "AUTH_TOKENS": ["token1", "token2"],
   "ROTATION_INTERVAL": "6h",
-  "REQUEST_TIMEOUT": "15m",
+  "REQUEST_TIMEOUT": "20m",
   "API_KEYS": ["optional-client-facing-key"],
   "HTTP_PROXY": "",
   "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6"],

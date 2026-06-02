@@ -127,7 +127,7 @@ func loadRawConfig(configPath string) (rawConfig, error) {
 		ListenAddr:            ":8080",
 		UpstreamBaseURL:       "https://www.codebuff.com",
 		RotationInterval:      "6h",
-		RequestTimeout:        "15m",
+		RequestTimeout:        "20m",
 		SessionRequiredModels: append([]string(nil), defaultSessionRequiredModels...),
 		PremiumSessionModels:  append([]string(nil), defaultPremiumSessionModels...),
 	}
