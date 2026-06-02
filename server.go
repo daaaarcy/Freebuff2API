@@ -156,6 +156,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "model is required", "invalid_request_error", "")
 		return
 	}
+	responseFormat, err := parseResponseFormat(payload["response_format"])
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
+		return
+	}
+	if err := validateResponseFormatSchema(responseFormat); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
+		return
+	}
+	stream := boolValue(payload["stream"])
 
 	s.proxyChatRequest(
 		w,
@@ -166,7 +176,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"server_error",
 		writeOpenAIError,
 		writePassthroughError,
-		writeOpenAISuccessResponse,
+		func(w http.ResponseWriter, resp *http.Response) error {
+			return writeOpenAISuccessResponse(w, resp, responseFormat, stream)
+		},
 	)
 }
 
@@ -266,6 +278,9 @@ func (s *Server) proxyChatRequest(
 
 	maxAttempts := maxInt(len(s.runs.pools)*2, 2)
 	var lastRateErr *rateLimitError
+	var lastTransientErr string
+	var structuredRetryInstruction string
+	var structuredValidationRetries int
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		lease, sessionInstanceID, err := s.runs.Acquire(r.Context(), agentID, requestedModel)
 		if err != nil {
@@ -299,7 +314,7 @@ func (s *Server) proxyChatRequest(
 
 		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.name, requestedModel, lease.run.id)
 
-		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, sessionInstanceID)
+		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, sessionInstanceID, structuredRetryInstruction)
 		if err != nil {
 			s.runs.Release(lease)
 			writeError(w, http.StatusBadRequest, err.Error(), invalidRequestType, "")
@@ -309,14 +324,43 @@ func (s *Server) proxyChatRequest(
 		resp, errorBody, err := s.client.ChatCompletions(r.Context(), lease.pool.token, upstreamBody)
 		if err != nil {
 			s.runs.Release(lease)
+			if isRetryableUpstreamTransportError(err) {
+				lastTransientErr = err.Error()
+				s.logger.Printf("[%s] retryable upstream transport error (attempt %d/%d): %s", lease.pool.name, attempt+1, maxAttempts, truncateForLog(err.Error()))
+				if !sleepBeforeRetry(r.Context(), attempt, maxAttempts) {
+					writeError(w, http.StatusBadGateway, "upstream temporary failure after retrying available attempts", serverErrorType, "upstream_temporary_failure")
+					return
+				}
+				continue
+			}
 			writeError(w, http.StatusBadGateway, err.Error(), serverErrorType, "")
 			return
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			defer resp.Body.Close()
-			if err := writeSuccess(w, resp); err != nil && !errors.Is(err, context.Canceled) {
-				s.logger.Printf("[%s] proxy response copy failed: %v", lease.pool.name, err)
+			err := writeSuccess(w, resp)
+			_ = resp.Body.Close()
+			if err != nil {
+				var validationErr *structuredOutputValidationError
+				if errors.As(err, &validationErr) {
+					s.runs.Release(lease)
+					if structuredValidationRetries < 1 && attempt+1 < maxAttempts {
+						structuredValidationRetries++
+						structuredRetryInstruction = validationErr.RetryInstruction()
+						s.logger.Printf("[%s] structured output validation failed (attempt %d/%d), retrying once: %s", lease.pool.name, attempt+1, maxAttempts, truncateForLog(validationErr.Error()))
+						if !sleepBeforeRetry(r.Context(), attempt, maxAttempts) {
+							writeError(w, http.StatusBadGateway, validationErr.Error(), serverErrorType, "upstream_response_validation_failed")
+							return
+						}
+						continue
+					}
+					s.logger.Printf("[%s] structured output validation failed after retry: %s", lease.pool.name, truncateForLog(validationErr.Error()))
+					writeError(w, http.StatusBadGateway, validationErr.Error(), serverErrorType, "upstream_response_validation_failed")
+					return
+				}
+				if !errors.Is(err, context.Canceled) {
+					s.logger.Printf("[%s] proxy response copy failed: %v", lease.pool.name, err)
+				}
 			}
 			s.logger.Printf("[%s] Request completed successfully in %v (status: %d)", lease.pool.name, time.Since(startTime).Round(time.Millisecond), resp.StatusCode)
 			s.runs.Release(lease)
@@ -359,6 +403,17 @@ func (s *Server) proxyChatRequest(
 			continue
 		}
 
+		if isRetryableUpstreamStatus(resp.StatusCode) {
+			lastTransientErr = fmt.Sprintf("upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(errorBody)))
+			s.logger.Printf("[%s] retryable upstream status (attempt %d/%d, status=%d): %s", lease.pool.name, attempt+1, maxAttempts, resp.StatusCode, truncateForLog(string(errorBody)))
+			s.runs.Release(lease)
+			if !sleepBeforeRetry(r.Context(), attempt, maxAttempts) {
+				writeError(w, http.StatusBadGateway, "upstream temporary failure after retrying available attempts", serverErrorType, "upstream_temporary_failure")
+				return
+			}
+			continue
+		}
+
 		s.logger.Printf("[%s] upstream error (attempt %d, status=%d): %s", lease.pool.name, attempt, resp.StatusCode, strings.TrimSpace(string(errorBody)))
 
 		s.runs.Release(lease)
@@ -374,16 +429,35 @@ func (s *Server) proxyChatRequest(
 		writeError(w, http.StatusTooManyRequests, lastRateErr.Error(), serverErrorType, "rate_limited")
 		return
 	}
+	if lastTransientErr != "" {
+		s.logger.Printf("upstream temporary failure exhausted retries: %s", truncateForLog(lastTransientErr))
+		writeError(w, http.StatusBadGateway, "upstream temporary failure after retrying available attempts", serverErrorType, "upstream_temporary_failure")
+		return
+	}
 	writeError(w, http.StatusBadGateway, "upstream transition failed after retrying available auth tokens", serverErrorType, "")
 }
 
-func writeOpenAISuccessResponse(w http.ResponseWriter, resp *http.Response) error {
+func writeOpenAISuccessResponse(w http.ResponseWriter, resp *http.Response, responseFormat structuredResponseFormat, stream bool) error {
+	if !stream && responseFormat.RequiresValidation() {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("read upstream response: %w", err)
+		}
+		if err := validateOpenAIChatCompletionStructuredOutput(body, responseFormat); err != nil {
+			return err
+		}
+		copyHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, err = w.Write(body)
+		return err
+	}
+
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	return copyResponseBody(w, resp.Body)
 }
 
-func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, runID, sessionInstanceID string) ([]byte, error) {
+func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, runID, sessionInstanceID string, retryInstructions ...string) ([]byte, error) {
 	cloned := cloneMap(payload)
 	cloned["model"] = requestedModel
 
@@ -392,6 +466,12 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 	// changing non-tool requests.
 	if tools, ok := cloned["tools"].([]any); ok {
 		normalizeToolSchemas(tools)
+	}
+	if err := normalizeResponseFormatForUpstream(cloned); err != nil {
+		return nil, err
+	}
+	if len(retryInstructions) > 0 {
+		prependSystemInstruction(cloned, retryInstructions[0])
 	}
 
 	metadata, ok := cloned["codebuff_metadata"].(map[string]any)
@@ -411,6 +491,26 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 		return nil, fmt.Errorf("marshal upstream request: %w", err)
 	}
 	return body, nil
+}
+
+func prependSystemInstruction(payload map[string]any, instruction string) {
+	instruction = strings.TrimSpace(instruction)
+	if instruction == "" {
+		return
+	}
+	systemMessage := map[string]any{
+		"role":    "system",
+		"content": instruction,
+	}
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		payload["messages"] = []any{systemMessage}
+		return
+	}
+	withInstruction := make([]any, 0, len(messages)+1)
+	withInstruction = append(withInstruction, systemMessage)
+	withInstruction = append(withInstruction, messages...)
+	payload["messages"] = withInstruction
 }
 
 func isSessionInvalid(statusCode int, errorBody []byte) bool {
@@ -771,6 +871,78 @@ func isRunInvalid(statusCode int, body []byte) bool {
 	}
 	message := strings.ToLower(string(body))
 	return strings.Contains(message, "runid not found") || strings.Contains(message, "runid not running")
+}
+
+func isRetryableUpstreamTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	retryableFragments := []string{
+		"unexpected eof",
+		"connection reset by peer",
+		"server closed idle connection",
+		"connection refused",
+	}
+	for _, fragment := range retryableFragments {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRetryableUpstreamStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func sleepBeforeRetry(ctx context.Context, attempt, maxAttempts int) bool {
+	if attempt+1 >= maxAttempts {
+		return true
+	}
+	delay := retryBackoff(attempt)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func retryBackoff(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := 50 * time.Millisecond
+	for i := 0; i < attempt && delay < time.Second; i++ {
+		delay *= 2
+	}
+	if delay > time.Second {
+		return time.Second
+	}
+	return delay
+}
+
+func truncateForLog(value string) string {
+	value = strings.TrimSpace(value)
+	const maxLogChars = 512
+	if len(value) <= maxLogChars {
+		return value
+	}
+	return value[:maxLogChars] + "...(truncated)"
 }
 
 func writePassthroughError(w http.ResponseWriter, statusCode int, body []byte) {
