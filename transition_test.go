@@ -18,20 +18,25 @@ import (
 
 const transitionTestModel = "deepseek/deepseek-v4-pro"
 const transitionTestAgent = "base2-free-deepseek"
+const transitionFlashModel = "deepseek/deepseek-v4-flash"
+const transitionFlashAgent = "base2-free-deepseek-flash"
+const transitionKimiModel = "moonshotai/kimi-k2.6"
+const transitionKimiAgent = "base2-free-kimi"
 
 type transitionUpstream struct {
 	t *testing.T
 
-	mu              sync.Mutex
-	starts          map[string]int
-	sessions        map[string][]freeSessionResponse
-	sessionErrors   map[string]upstreamError
-	chatStatuses    map[string][]upstreamError
-	chatDrops       map[string]int
-	chatTokens      []string
-	chatSessionIDs  []string
-	chatPayloads    []map[string]any
-	sessionRequests []string
+	mu                 sync.Mutex
+	starts             map[string]int
+	sessions           map[string][]freeSessionResponse
+	sessionErrors      map[string]upstreamError
+	modelSessionErrors map[string]upstreamError
+	chatStatuses       map[string][]upstreamError
+	chatDrops          map[string]int
+	chatTokens         []string
+	chatSessionIDs     []string
+	chatPayloads       []map[string]any
+	sessionRequests    []string
 }
 
 type upstreamError struct {
@@ -42,12 +47,13 @@ type upstreamError struct {
 func newTransitionUpstream(t *testing.T) (*transitionUpstream, *httptest.Server) {
 	t.Helper()
 	upstream := &transitionUpstream{
-		t:             t,
-		starts:        make(map[string]int),
-		sessions:      make(map[string][]freeSessionResponse),
-		sessionErrors: make(map[string]upstreamError),
-		chatStatuses:  make(map[string][]upstreamError),
-		chatDrops:     make(map[string]int),
+		t:                  t,
+		starts:             make(map[string]int),
+		sessions:           make(map[string][]freeSessionResponse),
+		sessionErrors:      make(map[string]upstreamError),
+		modelSessionErrors: make(map[string]upstreamError),
+		chatStatuses:       make(map[string][]upstreamError),
+		chatDrops:          make(map[string]int),
 	}
 	server := httptest.NewServer(http.HandlerFunc(upstream.handle))
 	t.Cleanup(server.Close)
@@ -98,6 +104,13 @@ func (u *transitionUpstream) handleSession(w http.ResponseWriter, r *http.Reques
 
 	u.mu.Lock()
 	u.sessionRequests = append(u.sessionRequests, token)
+	requestedModel := requestedSessionModel(u.t, r)
+	if configured, ok := u.modelSessionErrors[token+"|"+requestedModel]; ok {
+		u.mu.Unlock()
+		w.WriteHeader(configured.status)
+		_, _ = w.Write([]byte(configured.body))
+		return
+	}
 	if configured, ok := u.sessionErrors[token]; ok {
 		u.mu.Unlock()
 		w.WriteHeader(configured.status)
@@ -115,6 +128,11 @@ func (u *transitionUpstream) handleSession(w http.ResponseWriter, r *http.Reques
 	u.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, response)
+}
+
+func requestedSessionModel(t *testing.T, r *http.Request) string {
+	t.Helper()
+	return strings.TrimSpace(r.Header.Get("x-freebuff-model"))
 }
 
 func (u *transitionUpstream) handleChat(w http.ResponseWriter, r *http.Request, token string) {
@@ -183,6 +201,14 @@ func (u *transitionUpstream) chatPayloadSequence() []map[string]any {
 	return out
 }
 
+func (u *transitionUpstream) sessionRequestSequence() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	out := make([]string, len(u.sessionRequests))
+	copy(out, u.sessionRequests)
+	return out
+}
+
 func dropConnection(t *testing.T, w http.ResponseWriter) {
 	t.Helper()
 	hijacker, ok := w.(http.Hijacker)
@@ -216,9 +242,17 @@ func newTransitionServer(baseURL string, tokens []string) *Server {
 	logger := log.New(io.Discard, "", 0)
 	client := NewUpstreamClient(cfg)
 	registry := &ModelRegistry{
-		agentModels:  map[string][]string{transitionTestAgent: {transitionTestModel}},
-		modelToAgent: map[string]string{transitionTestModel: transitionTestAgent},
-		allModels:    []string{transitionTestModel},
+		agentModels: map[string][]string{
+			transitionTestAgent:  {transitionTestModel},
+			transitionFlashAgent: {transitionFlashModel},
+			transitionKimiAgent:  {transitionKimiModel},
+		},
+		modelToAgent: map[string]string{
+			transitionTestModel:  transitionTestAgent,
+			transitionFlashModel: transitionFlashAgent,
+			transitionKimiModel:  transitionKimiAgent,
+		},
+		allModels: []string{transitionTestModel, transitionFlashModel, transitionKimiModel},
 	}
 	return &Server{
 		cfg:      cfg,
@@ -242,6 +276,120 @@ func performChatRequestBody(t *testing.T, server *Server, body string) *httptest
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, req)
 	return recorder
+}
+
+func TestProxyUsesSharedFreeSessionForFlashModel(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1"})
+
+	recorder := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200", recorder.Code, recorder.Body.String())
+	}
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1"; got != want {
+		t.Fatalf("session requests = %s, want one shared free session", got)
+	}
+	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-session"; got != want {
+		t.Fatalf("chat session IDs = %q, want shared session ID", got)
+	}
+}
+
+func TestProxyRetriesSessionInvalidResponseForFlashModel(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	upstream.chatStatuses["token-1"] = []upstreamError{{
+		status: http.StatusUpgradeRequired,
+		body:   `{"error":"freebuff_update_required","message":"This version of freebuff is out of date."}`,
+	}}
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1"})
+
+	recorder := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200", recorder.Code, recorder.Body.String())
+	}
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1,token-1"; got != want {
+		t.Fatalf("session requests = %s, want initial and refreshed free sessions", got)
+	}
+	if got, want := len(upstream.chatTokenSequence()), 2; got != want {
+		t.Fatalf("chat attempts = %d, want %d", got, want)
+	}
+}
+
+func TestProxySharesOneSessionAcrossSamePremiumModelRequests(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1"})
+
+	first := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, body = %s, want 200", first.Code, first.Body.String())
+	}
+	second := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"hi again"}]}`)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, body = %s, want 200", second.Code, second.Body.String())
+	}
+
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1"; got != want {
+		t.Fatalf("session requests = %s, want one shared premium session", got)
+	}
+	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-session,token-1-session"; got != want {
+		t.Fatalf("chat session IDs = %s, want one shared premium session ID", got)
+	}
+}
+
+func TestFlashReusesExistingPremiumSessionWithoutStartingNewSession(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1"})
+
+	pro := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)
+	if pro.Code != http.StatusOK {
+		t.Fatalf("pro status = %d, body = %s, want 200", pro.Code, pro.Body.String())
+	}
+	flash := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
+	if flash.Code != http.StatusOK {
+		t.Fatalf("flash status = %d, body = %s, want 200", flash.Code, flash.Body.String())
+	}
+
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1"; got != want {
+		t.Fatalf("session requests = %s, want flash to reuse existing pro session", got)
+	}
+	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-session,token-1-session"; got != want {
+		t.Fatalf("chat session IDs = %s, want shared pro session for flash", got)
+	}
+
+	snapshots := server.runs.Snapshots()
+	if got := snapshots[0].SessionModel; got != transitionTestModel {
+		t.Fatalf("session model = %q, want original pro model", got)
+	}
+	if got := snapshots[0].SessionStartedCounts[transitionTestModel]; got != 1 {
+		t.Fatalf("pro session starts = %d, want 1", got)
+	}
+	if got := snapshots[0].SessionStartedCounts[transitionFlashModel]; got != 0 {
+		t.Fatalf("flash session starts = %d, want 0 when reusing pro session", got)
+	}
+}
+
+func TestFlashReusesPremiumSessionWhilePremiumRequestInflight(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1", "token-2"})
+
+	proLease, _, err := server.runs.Acquire(context.Background(), transitionTestAgent, transitionTestModel)
+	if err != nil {
+		t.Fatalf("acquire pro lease: %v", err)
+	}
+	defer server.runs.Release(proLease)
+
+	flash := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
+	if flash.Code != http.StatusOK {
+		t.Fatalf("flash status = %d, body = %s, want 200", flash.Code, flash.Body.String())
+	}
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1"; got != want {
+		t.Fatalf("session requests = %s, want flash to reuse in-flight pro session", got)
+	}
+	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1"; got != want {
+		t.Fatalf("chat tokens = %s, want flash to stay on token-1", got)
+	}
+	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-session"; got != want {
+		t.Fatalf("chat session IDs = %s, want pro session reused for flash", got)
+	}
 }
 
 func TestAcquireReturnsBestWaitingRoomWhenAllTokensQueued(t *testing.T) {
@@ -327,6 +475,48 @@ func TestAcquireReturnsEarliestRateLimitWhenAllTokensLimited(t *testing.T) {
 	}
 }
 
+func TestAcquireRateLimitCoolsOnlyRequestedModel(t *testing.T) {
+	resetAt := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	upstream, upstreamServer := newTransitionUpstream(t)
+	upstream.modelSessionErrors["token-1|"+transitionFlashModel] = upstreamError{
+		status: http.StatusTooManyRequests,
+		body:   `{"model":"` + transitionFlashModel + `","resetAt":"` + resetAt + `","retryAfterMs":3600000,"limit":5,"recentCount":5}`,
+	}
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1"})
+
+	flashLease, _, flashErr := server.runs.Acquire(context.Background(), transitionFlashAgent, transitionFlashModel)
+	if flashLease != nil {
+		t.Fatalf("flash lease = %#v, want nil", flashLease)
+	}
+	var rateErr *rateLimitError
+	if !errors.As(flashErr, &rateErr) {
+		t.Fatalf("flash err = %v, want rateLimitError", flashErr)
+	}
+
+	proLease, _, proErr := server.runs.Acquire(context.Background(), transitionTestAgent, transitionTestModel)
+	if proErr != nil {
+		t.Fatalf("pro acquire after flash limit: %v", proErr)
+	}
+	if proLease == nil || proLease.pool.name != "token-1" {
+		t.Fatalf("pro lease = %#v, want token-1 lease", proLease)
+	}
+	server.runs.Release(proLease)
+
+	snapshots := server.runs.Snapshots()
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshots len = %d, want 1", len(snapshots))
+	}
+	if !snapshots[0].CooldownUntil.IsZero() {
+		t.Fatalf("token cooldown = %s, want no token-wide cooldown", snapshots[0].CooldownUntil)
+	}
+	if len(snapshots[0].ModelCooldowns) != 1 {
+		t.Fatalf("model cooldowns = %#v, want one flash cooldown", snapshots[0].ModelCooldowns)
+	}
+	if got := snapshots[0].ModelCooldowns[0].Model; got != transitionFlashModel {
+		t.Fatalf("model cooldown = %q, want %q", got, transitionFlashModel)
+	}
+}
+
 func TestProxyRetriesUnauthorizedChatOnNextToken(t *testing.T) {
 	upstream, upstreamServer := newTransitionUpstream(t)
 	upstream.chatStatuses["token-1"] = []upstreamError{{
@@ -360,6 +550,28 @@ func TestProxyRetriesRateLimitedChatOnNextToken(t *testing.T) {
 		t.Fatalf("status = %d, body = %s, want 200", recorder.Code, recorder.Body.String())
 	}
 	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1,token-2"; got != want {
+		t.Fatalf("chat tokens = %s, want %s", got, want)
+	}
+}
+
+func TestProxyChatRateLimitCoolsOnlyRequestedModel(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	upstream.chatStatuses["token-1"] = []upstreamError{{
+		status: http.StatusTooManyRequests,
+		body:   `{"model":"` + transitionFlashModel + `","resetAt":"` + time.Now().Add(time.Hour).UTC().Format(time.RFC3339) + `","retryAfterMs":3600000,"limit":5,"recentCount":5}`,
+	}}
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1"})
+
+	flash := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
+	if flash.Code != http.StatusTooManyRequests {
+		t.Fatalf("flash status = %d, body = %s, want 429", flash.Code, flash.Body.String())
+	}
+
+	pro := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)
+	if pro.Code != http.StatusOK {
+		t.Fatalf("pro status = %d, body = %s, want 200", pro.Code, pro.Body.String())
+	}
+	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1,token-1"; got != want {
 		t.Fatalf("chat tokens = %s, want %s", got, want)
 	}
 }

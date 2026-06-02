@@ -26,13 +26,21 @@ type tokenPool struct {
 	client *UpstreamClient
 	logger *log.Logger
 
-	mu               sync.Mutex
-	runs             map[string]*managedRun // agentID -> current run
-	draining         []*managedRun
-	sessions         map[string]*cachedSession // model -> session
-	sessionRefreshCh map[string]chan struct{}  // model -> refresh channel
-	lastError        string
-	cooldownUntil    time.Time
+	mu                   sync.Mutex
+	runs                 map[string]*managedRun // agentID -> current run
+	draining             []*managedRun
+	session              *cachedSession
+	sessionRefreshCh     chan struct{}
+	sessionInflight      int
+	sessionStartedCounts map[string]int
+	lastError            string
+	cooldownUntil        time.Time
+	modelCooldowns       map[string]modelCooldown
+}
+
+type modelCooldown struct {
+	Until  time.Time
+	Reason string
 }
 
 type managedRun struct {
@@ -45,22 +53,34 @@ type managedRun struct {
 }
 
 type runLease struct {
-	pool *tokenPool
-	run  *managedRun
+	pool              *tokenPool
+	run               *managedRun
+	sessionInstanceID string
 }
 
 type tokenSnapshot struct {
-	Name              string        `json:"name"`
-	Runs              []runSnapshot `json:"runs"`
-	DrainingRuns      int           `json:"draining_runs"`
-	SessionStatus     string        `json:"session_status,omitempty"`
-	SessionInstanceID string        `json:"session_instance_id,omitempty"`
-	SessionExpiresAt  time.Time     `json:"session_expires_at,omitempty"`
-	SessionPosition   int           `json:"session_position,omitempty"`
-	SessionQueueDepth int           `json:"session_queue_depth,omitempty"`
-	SessionPollAt     time.Time     `json:"session_poll_at,omitempty"`
-	CooldownUntil     time.Time     `json:"cooldown_until,omitempty"`
-	LastError         string        `json:"last_error,omitempty"`
+	Name                 string                  `json:"name"`
+	Runs                 []runSnapshot           `json:"runs"`
+	DrainingRuns         int                     `json:"draining_runs"`
+	SessionStatus        string                  `json:"session_status,omitempty"`
+	SessionModel         string                  `json:"session_model,omitempty"`
+	SessionPremium       bool                    `json:"session_premium"`
+	SessionInstanceID    string                  `json:"session_instance_id,omitempty"`
+	SessionExpiresAt     time.Time               `json:"session_expires_at,omitempty"`
+	SessionPosition      int                     `json:"session_position,omitempty"`
+	SessionQueueDepth    int                     `json:"session_queue_depth,omitempty"`
+	SessionPollAt        time.Time               `json:"session_poll_at,omitempty"`
+	SessionInflight      int                     `json:"session_inflight,omitempty"`
+	SessionStartedCounts map[string]int          `json:"session_started_counts,omitempty"`
+	CooldownUntil        time.Time               `json:"cooldown_until,omitempty"`
+	ModelCooldowns       []modelCooldownSnapshot `json:"model_cooldowns,omitempty"`
+	LastError            string                  `json:"last_error,omitempty"`
+}
+
+type modelCooldownSnapshot struct {
+	Model  string    `json:"model"`
+	Until  time.Time `json:"until"`
+	Reason string    `json:"reason,omitempty"`
 }
 
 type runSnapshot struct {
@@ -87,10 +107,15 @@ type rateLimitError struct {
 }
 
 type cooldownError struct {
-	Until time.Time
+	Until  time.Time
+	Model  string
+	Reason string
 }
 
 func (e *cooldownError) Error() string {
+	if strings.TrimSpace(e.Model) != "" {
+		return fmt.Sprintf("model %s cooling down until %s", e.Model, e.Until.Format(time.RFC3339))
+	}
 	return fmt.Sprintf("token cooling down until %s", e.Until.Format(time.RFC3339))
 }
 
@@ -131,14 +156,14 @@ func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunM
 	pools := make([]*tokenPool, 0, len(cfg.AuthTokens))
 	for index, token := range cfg.AuthTokens {
 		pools = append(pools, &tokenPool{
-			name:             fmt.Sprintf("token-%d", index+1),
-			token:            token,
-			cfg:              cfg,
-			client:           client,
-			runs:             make(map[string]*managedRun),
-			sessions:         make(map[string]*cachedSession),
-			sessionRefreshCh: make(map[string]chan struct{}),
-			logger:           logger,
+			name:                 fmt.Sprintf("token-%d", index+1),
+			token:                token,
+			cfg:                  cfg,
+			client:               client,
+			runs:                 make(map[string]*managedRun),
+			sessionStartedCounts: make(map[string]int),
+			modelCooldowns:       make(map[string]modelCooldown),
+			logger:               logger,
 		})
 	}
 
@@ -251,6 +276,12 @@ func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLe
 		return nil, "", bestRateLimitError(rateLimits)
 	}
 
+	if len(cooldowns) > 0 && transitionErrors == len(m.pools) {
+		if cooldown := bestModelCooldownError(cooldowns); cooldown != nil {
+			return nil, "", cooldown
+		}
+	}
+
 	return nil, "", fmt.Errorf("unable to acquire run from any token (%s)", strings.Join(errs, "; "))
 }
 
@@ -258,7 +289,7 @@ func (m *RunManager) Release(lease *runLease) {
 	if lease == nil || lease.pool == nil || lease.run == nil {
 		return
 	}
-	lease.pool.release(lease.run)
+	lease.pool.release(lease)
 }
 
 func (m *RunManager) Invalidate(lease *runLease, reason string) {
@@ -275,6 +306,13 @@ func (m *RunManager) Cooldown(lease *runLease, duration time.Duration, reason st
 	lease.pool.markCooldown(duration, reason)
 }
 
+func (m *RunManager) CooldownModel(lease *runLease, model string, duration time.Duration, reason string) {
+	if lease == nil || lease.pool == nil {
+		return
+	}
+	lease.pool.markModelCooldown(model, duration, reason)
+}
+
 func (m *RunManager) Snapshots() []tokenSnapshot {
 	snapshots := make([]tokenSnapshot, 0, len(m.pools))
 	for _, pool := range m.pools {
@@ -285,10 +323,15 @@ func (m *RunManager) Snapshots() []tokenSnapshot {
 
 func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLease, string, error) {
 	p.mu.Lock()
-	if now := time.Now(); now.Before(p.cooldownUntil) {
+	now := time.Now()
+	if now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
 		p.mu.Unlock()
 		return nil, "", &cooldownError{Until: cooldownUntil}
+	}
+	if cooldown, ok := p.modelCooldownLocked(model, now); ok {
+		p.mu.Unlock()
+		return nil, "", &cooldownError{Until: cooldown.Until, Model: strings.TrimSpace(model), Reason: cooldown.Reason}
 	}
 	run := p.runs[agentID]
 	needsRotate := run == nil || time.Since(run.startedAt) >= p.cfg.RotationInterval
@@ -300,13 +343,17 @@ func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLea
 		}
 	}
 
-	sessionInstanceID, err := p.ensureSession(ctx, model)
-	if err != nil {
-		var rateErr *rateLimitError
-		if errors.As(err, &rateErr) && rateErr.RetryAfter > 0 {
-			p.markCooldown(rateErr.RetryAfter, fmt.Sprintf("rate limited for %s", model))
+	var sessionInstanceID string
+	if p.cfg.RequiresFreeSession(model) {
+		var err error
+		sessionInstanceID, err = p.ensureSession(ctx, model)
+		if err != nil {
+			var rateErr *rateLimitError
+			if errors.As(err, &rateErr) && rateErr.RetryAfter > 0 {
+				p.markModelCooldown(model, rateErr.RetryAfter, fmt.Sprintf("rate limited for %s", model))
+			}
+			return nil, "", err
 		}
-		return nil, "", err
 	}
 
 	p.mu.Lock()
@@ -317,7 +364,10 @@ func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLea
 	}
 	run.inflight++
 	run.requestCount++
-	return &runLease{pool: p, run: run}, sessionInstanceID, nil
+	if sessionInstanceID != "" {
+		p.sessionInflight++
+	}
+	return &runLease{pool: p, run: run, sessionInstanceID: sessionInstanceID}, sessionInstanceID, nil
 }
 
 func bestWaitingRoomError(waiting []*waitingRoomError) *waitingRoomError {
@@ -339,6 +389,20 @@ func bestWaitingRoomError(waiting []*waitingRoomError) *waitingRoomError {
 		}
 		if candidate.Position == best.Position && candidate.RetryAfter > 0 && (best.RetryAfter == 0 || candidate.RetryAfter < best.RetryAfter) {
 			best = candidate
+		}
+	}
+	return best
+}
+
+func bestModelCooldownError(cooldowns []*cooldownError) *cooldownError {
+	var best *cooldownError
+	for _, candidate := range cooldowns {
+		if candidate == nil || strings.TrimSpace(candidate.Model) == "" {
+			continue
+		}
+		if best == nil || candidate.Until.Before(best.Until) {
+			copy := *candidate
+			best = &copy
 		}
 	}
 	return best
@@ -370,15 +434,18 @@ func bestRateLimitError(rateLimits []*rateLimitError) *rateLimitError {
 
 func (p *tokenPool) maintain(ctx context.Context) error {
 	p.mu.Lock()
-	models := make([]string, 0, len(p.sessions))
-	for model := range p.sessions {
-		models = append(models, model)
+	hasSession := p.session != nil
+	sessionModel := ""
+	if p.session != nil {
+		sessionModel = p.session.model
 	}
 	p.mu.Unlock()
-
-	for _, model := range models {
-		if _, err := p.ensureSession(ctx, model); err != nil {
-			p.logger.Printf("%s: refresh free session for %s failed: %v", p.name, model, err)
+	if hasSession {
+		if _, err := p.ensureSession(ctx, sessionModel); err != nil {
+			var busyErr *sessionBusyError
+			if !errors.As(err, &busyErr) {
+				p.logger.Printf("%s: refresh free session failed: %v", p.name, err)
+			}
 		}
 	}
 
@@ -472,14 +539,21 @@ func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
 	return nil
 }
 
-func (p *tokenPool) release(run *managedRun) {
-	if run == nil {
+func (p *tokenPool) release(lease *runLease) {
+	if lease == nil || lease.run == nil {
 		return
 	}
 
 	p.mu.Lock()
+	run := lease.run
 	if run.inflight > 0 {
 		run.inflight--
+	}
+	if lease.sessionInstanceID != "" &&
+		p.session != nil &&
+		p.session.instanceID == lease.sessionInstanceID &&
+		p.sessionInflight > 0 {
+		p.sessionInflight--
 	}
 	p.mu.Unlock()
 
@@ -558,6 +632,41 @@ func (p *tokenPool) markCooldown(duration time.Duration, reason string) {
 	}
 }
 
+func (p *tokenPool) markModelCooldown(model string, duration time.Duration, reason string) {
+	model = strings.TrimSpace(model)
+	if model == "" || duration <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.modelCooldowns == nil {
+		p.modelCooldowns = make(map[string]modelCooldown)
+	}
+	p.modelCooldowns[model] = modelCooldown{
+		Until:  time.Now().Add(duration),
+		Reason: reason,
+	}
+	if reason != "" {
+		p.lastError = reason
+	}
+}
+
+func (p *tokenPool) modelCooldownLocked(model string, now time.Time) (modelCooldown, bool) {
+	model = strings.TrimSpace(model)
+	if model == "" || len(p.modelCooldowns) == 0 {
+		return modelCooldown{}, false
+	}
+	cooldown, ok := p.modelCooldowns[model]
+	if !ok {
+		return modelCooldown{}, false
+	}
+	if cooldown.Until.IsZero() || now.Before(cooldown.Until) {
+		return cooldown, true
+	}
+	delete(p.modelCooldowns, model)
+	return modelCooldown{}, false
+}
+
 func (p *tokenPool) snapshot() tokenSnapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -568,16 +677,33 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 		CooldownUntil: p.cooldownUntil,
 		LastError:     p.lastError,
 	}
-	// Show first active session for health display
-	for _, session := range p.sessions {
-		if session != nil {
-			snapshot.SessionStatus = string(session.status)
-			snapshot.SessionInstanceID = session.instanceID
-			snapshot.SessionExpiresAt = session.expiresAt
-			snapshot.SessionPosition = session.position
-			snapshot.SessionQueueDepth = session.queueDepth
-			snapshot.SessionPollAt = session.pollAt
-			break
+	now := time.Now()
+	for model, cooldown := range p.modelCooldowns {
+		if !cooldown.Until.IsZero() && now.After(cooldown.Until) {
+			delete(p.modelCooldowns, model)
+			continue
+		}
+		snapshot.ModelCooldowns = append(snapshot.ModelCooldowns, modelCooldownSnapshot{
+			Model:  model,
+			Until:  cooldown.Until,
+			Reason: cooldown.Reason,
+		})
+	}
+	if p.session != nil {
+		snapshot.SessionStatus = string(p.session.status)
+		snapshot.SessionModel = p.session.model
+		snapshot.SessionPremium = p.cfg.RequiresPremiumSession(p.session.model)
+		snapshot.SessionInstanceID = p.session.instanceID
+		snapshot.SessionExpiresAt = p.session.expiresAt
+		snapshot.SessionPosition = p.session.position
+		snapshot.SessionQueueDepth = p.session.queueDepth
+		snapshot.SessionPollAt = p.session.pollAt
+		snapshot.SessionInflight = p.sessionInflight
+	}
+	if len(p.sessionStartedCounts) > 0 {
+		snapshot.SessionStartedCounts = make(map[string]int, len(p.sessionStartedCounts))
+		for model, count := range p.sessionStartedCounts {
+			snapshot.SessionStartedCounts[model] = count
 		}
 	}
 	for agentID, run := range p.runs {

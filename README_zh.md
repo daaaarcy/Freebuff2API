@@ -66,7 +66,9 @@ npm i -g freebuff
   "ROTATION_INTERVAL": "6h",
   "REQUEST_TIMEOUT": "15m",
   "API_KEYS": [],
-  "HTTP_PROXY": ""
+  "HTTP_PROXY": "",
+  "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6"],
+  "PREMIUM_SESSION_MODELS": ["deepseek/deepseek-v4-pro", "moonshotai/kimi-k2.6"]
 }
 ```
 
@@ -81,8 +83,12 @@ npm i -g freebuff
 | `REQUEST_TIMEOUT` | 上游请求超时时间（默认 `15m`） |
 | `API_KEYS` | 客户端鉴权 API Key（留空则无需鉴权） |
 | `HTTP_PROXY` | 上游 HTTP 代理地址 |
+| `SESSION_REQUIRED_MODELS` | 需要共享 Freebuff 会话实例 ID 的模型 |
+| `PREMIUM_SESSION_MODELS` | 计入 Premium 会话额度的会话模型 |
 
 同时设置时，环境变量优先于 JSON 配置文件。
+
+Premium 会话额度冷却按 Auth Token 和模型分别记录。某个 Premium 模型的 429 不会让同一个 Token 对其他模型整体冷却；401 鉴权失败仍然会让整个 Token 冷却。`deepseek/deepseek-v4-flash` 需要 session instance ID，但不计入 Premium；如果某个 Token 已有活跃 session，flash 可以复用该 instance ID，而不是强制切换 Premium session。
 
 ## 部署运行
 

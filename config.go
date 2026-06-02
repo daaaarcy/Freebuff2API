@@ -13,24 +13,40 @@ import (
 )
 
 type Config struct {
-	ListenAddr       string
-	UpstreamBaseURL  string
-	AuthTokens       []string
-	RotationInterval time.Duration
-	RequestTimeout   time.Duration
-	UserAgent        string
-	APIKeys          []string
-	HTTPProxy        string
+	ListenAddr            string
+	UpstreamBaseURL       string
+	AuthTokens            []string
+	RotationInterval      time.Duration
+	RequestTimeout        time.Duration
+	UserAgent             string
+	APIKeys               []string
+	HTTPProxy             string
+	SessionRequiredModels []string
+	PremiumSessionModels  []string
 }
 
 type rawConfig struct {
-	ListenAddr       string   `json:"LISTEN_ADDR"`
-	UpstreamBaseURL  string   `json:"UPSTREAM_BASE_URL"`
-	AuthTokens       []string `json:"AUTH_TOKENS"`
-	RotationInterval string   `json:"ROTATION_INTERVAL"`
-	RequestTimeout   string   `json:"REQUEST_TIMEOUT"`
-	APIKeys          []string `json:"API_KEYS"`
-	HTTPProxy        string   `json:"HTTP_PROXY"`
+	ListenAddr            string   `json:"LISTEN_ADDR"`
+	UpstreamBaseURL       string   `json:"UPSTREAM_BASE_URL"`
+	AuthTokens            []string `json:"AUTH_TOKENS"`
+	RotationInterval      string   `json:"ROTATION_INTERVAL"`
+	RequestTimeout        string   `json:"REQUEST_TIMEOUT"`
+	APIKeys               []string `json:"API_KEYS"`
+	HTTPProxy             string   `json:"HTTP_PROXY"`
+	SessionRequiredModels []string `json:"SESSION_REQUIRED_MODELS"`
+	PremiumSessionModels  []string `json:"PREMIUM_SESSION_MODELS"`
+}
+
+var defaultSessionRequiredModels = []string{
+	"deepseek/deepseek-v4-pro",
+	"deepseek/deepseek-v4-flash",
+	"minimax/minimax-m2.7",
+	"moonshotai/kimi-k2.6",
+}
+
+var defaultPremiumSessionModels = []string{
+	"deepseek/deepseek-v4-pro",
+	"moonshotai/kimi-k2.6",
 }
 
 func loadConfig(configPath string) (Config, error) {
@@ -46,6 +62,8 @@ func loadConfig(configPath string) (Config, error) {
 	overrideCSV(&cfg.AuthTokens, "AUTH_TOKENS")
 	overrideCSV(&cfg.APIKeys, "API_KEYS")
 	overrideString(&cfg.HTTPProxy, "HTTP_PROXY")
+	overrideCSV(&cfg.SessionRequiredModels, "SESSION_REQUIRED_MODELS")
+	overrideCSV(&cfg.PremiumSessionModels, "PREMIUM_SESSION_MODELS")
 
 	rotationInterval, err := time.ParseDuration(strings.TrimSpace(cfg.RotationInterval))
 	if err != nil {
@@ -58,14 +76,16 @@ func loadConfig(configPath string) (Config, error) {
 	}
 
 	finalCfg := Config{
-		ListenAddr:       strings.TrimSpace(cfg.ListenAddr),
-		UpstreamBaseURL:  normalizeUpstreamBaseURL(cfg.UpstreamBaseURL),
-		AuthTokens:       dedupeStrings(cfg.AuthTokens),
-		RotationInterval: rotationInterval,
-		RequestTimeout:   requestTimeout,
-		UserAgent:        generateUserAgent(),
-		APIKeys:          dedupeStrings(cfg.APIKeys),
-		HTTPProxy:        strings.TrimSpace(cfg.HTTPProxy),
+		ListenAddr:            strings.TrimSpace(cfg.ListenAddr),
+		UpstreamBaseURL:       normalizeUpstreamBaseURL(cfg.UpstreamBaseURL),
+		AuthTokens:            dedupeStrings(cfg.AuthTokens),
+		RotationInterval:      rotationInterval,
+		RequestTimeout:        requestTimeout,
+		UserAgent:             generateUserAgent(),
+		APIKeys:               dedupeStrings(cfg.APIKeys),
+		HTTPProxy:             strings.TrimSpace(cfg.HTTPProxy),
+		SessionRequiredModels: dedupeStrings(cfg.SessionRequiredModels),
+		PremiumSessionModels:  dedupeStrings(cfg.PremiumSessionModels),
 	}
 
 	switch {
@@ -104,10 +124,12 @@ func normalizeUpstreamBaseURL(raw string) string {
 
 func loadRawConfig(configPath string) (rawConfig, error) {
 	cfg := rawConfig{
-		ListenAddr:       ":8080",
-		UpstreamBaseURL:  "https://www.codebuff.com",
-		RotationInterval: "6h",
-		RequestTimeout:   "15m",
+		ListenAddr:            ":8080",
+		UpstreamBaseURL:       "https://www.codebuff.com",
+		RotationInterval:      "6h",
+		RequestTimeout:        "15m",
+		SessionRequiredModels: append([]string(nil), defaultSessionRequiredModels...),
+		PremiumSessionModels:  append([]string(nil), defaultPremiumSessionModels...),
 	}
 
 	if configPath != "" {
@@ -180,6 +202,22 @@ func containsString(values []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func (cfg Config) RequiresFreeSession(model string) bool {
+	models := cfg.SessionRequiredModels
+	if len(models) == 0 {
+		models = defaultSessionRequiredModels
+	}
+	return containsString(models, strings.TrimSpace(model))
+}
+
+func (cfg Config) RequiresPremiumSession(model string) bool {
+	models := cfg.PremiumSessionModels
+	if len(models) == 0 {
+		models = defaultPremiumSessionModels
+	}
+	return containsString(models, strings.TrimSpace(model))
 }
 
 func generateUserAgent() string {

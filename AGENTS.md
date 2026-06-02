@@ -66,28 +66,32 @@ Upstream (www.codebuff.com)
   "ROTATION_INTERVAL": "6h",
   "REQUEST_TIMEOUT": "15m",
   "API_KEYS": ["optional-client-facing-key"],
-  "HTTP_PROXY": ""
+  "HTTP_PROXY": "",
+  "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6"],
+  "PREMIUM_SESSION_MODELS": ["deepseek/deepseek-v4-pro", "moonshotai/kimi-k2.6"]
 }
 ```
 
-All fields overrideable by env vars of the same name. `AUTH_TOKENS` and `API_KEYS` accept comma-separated values.
+All fields overrideable by env vars of the same name. `AUTH_TOKENS`, `API_KEYS`, `SESSION_REQUIRED_MODELS`, and `PREMIUM_SESSION_MODELS` accept comma-separated values.
 
 ## Token Pool & Failover Strategy
 
 One `tokenPool` per `AUTH_TOKEN`. **Sequential failover, not round-robin:**
 
 1. **Only pool 0 (token-1) prewarms** on startup — creates runs for all 16 agents
-2. **Backup pools stay idle** — no runs, no sessions, until needed
+2. **Backup pools stay idle** — no runs, no premium sessions, until needed
 3. **Requests always try pool 0 first** — if it succeeds, done
-4. **On session acquisition 429** — pool enters cooldown until `resetAt`/`Retry-After`, try next pool
-5. **On chat 429 or 401** — active token is cooled down, session is invalidated, request retries through next pool before returning an error
-6. **Backups activate lazily** — first request on a backup pool creates its run and session on demand
+4. **On session acquisition 429** — that token/model pair enters cooldown until `resetAt`/`Retry-After`, try next pool
+5. **On chat 429** — that token/model pair is cooled down, session is invalidated, request retries through next pool before returning an error
+6. **On chat 401** — the active token is cooled down token-wide because auth was rejected
+7. **Backups activate lazily** — first request on a backup pool creates its run and premium session on demand
 
-This ensures at most one token has an active premium session at any time, preserving the 1h session quota across tokens.
+Current Freebuff models share one active session per token. Premium quota cooldowns are tracked per token/model because premium sessions are limited per model, while auth failures remain token-wide.
 
 When every token is unavailable, `RunManager.Acquire()` preserves the most useful client-facing transition error:
 - all available tokens queued → best `waitingRoomError` by queue position/retry delay
 - all available tokens rate-limited → best `rateLimitError` by earliest reset/retry delay
+- all available tokens cooling for the requested model → `cooldownError` surfaced as 429 with `Retry-After`
 - cooldown-only or mixed unknown failures → generic 502 with per-token details in logs/error text
 
 ## Key Error Types
@@ -118,15 +122,23 @@ Falls back to `hardcodedFallback` map if upstream fetch fails.
 
 ## Session Management
 
-Sessions are **per-pool, per-model** (`sessions map[model]*cachedSession`).
+Only models listed in `SESSION_REQUIRED_MODELS` use `/api/v1/freebuff/session`. Defaults are the current public Freebuff model IDs: `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`, `minimax/minimax-m2.7`, and `moonshotai/kimi-k2.6`.
 
-Lifecycle: `ensureSession()` → check cache → `refreshSession()` → POST `/api/v1/freebuff/session` → poll until active → cache with expiry.
+Only models listed in `PREMIUM_SESSION_MODELS` are counted as premium session models. Defaults: `deepseek/deepseek-v4-pro` and `moonshotai/kimi-k2.6`.
 
-`RunManager.Acquire()` calls `ensureSession()` before leasing the run and returns the selected session instance ID to `proxyChatRequest`; handlers should not call `ensureSession()` a second time for the same request.
+Freebuff sessions are **per-pool shared sessions** (`session *cachedSession`), not per-model sessions.
 
-Active sessions are treated as stale inside the final 2 minutes before `expiresAt` (`freeSessionRefreshSafetyWindow`) so normal requests refresh before hitting upstream `session_expired`.
+Lifecycle: `ensureSession()` → check shared cache → `refreshSession()` → POST `/api/v1/freebuff/session` → poll until active → cache with expiry.
 
-Model switching requires ending the current session first (upstream binds sessions to models).
+For session-required models, `RunManager.Acquire()` calls `ensureSession()` before leasing the run and returns the selected session instance ID to `proxyChatRequest`; handlers should not call `ensureSession()` a second time for the same request.
+
+Active sessions are treated as stale inside the final 2 minutes before `expiresAt` (`freeSessionRefreshSafetyWindow`) so normal requests refresh before hitting upstream `session_expired`. If the session has in-flight requests, refresh is deferred and the request fails over to another token instead of ending the active session.
+
+If a premium model requests a different active premium session and that session has no in-flight requests, the old session is ended before starting the requested model session. If it has in-flight requests, the request fails over instead of interrupting the long-running stream.
+
+`deepseek/deepseek-v4-flash` is session-required but not premium-counted. If a token already has an active session, flash may reuse that session instance ID even when it was started for a premium model; it should not tear down a premium session just to run flash.
+
+Session starts are logged with token, model, premium flag, instance ID, expiry, and per-model start count. `/healthz` exposes `session_model`, `session_premium`, and `session_started_counts` for each token.
 
 ## Upstream Request Injection
 

@@ -301,6 +301,19 @@ func (s *Server) proxyChatRequest(
 				writeError(w, http.StatusTooManyRequests, msg, serverErrorType, "rate_limited")
 				return
 			}
+			var cooldownErr *cooldownError
+			if errors.As(err, &cooldownErr) && strings.TrimSpace(cooldownErr.Model) != "" {
+				retryAfter := time.Until(cooldownErr.Until)
+				if retryAfter > 0 {
+					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", retryAfter.Seconds()))
+				}
+				message := cooldownErr.Error()
+				if strings.TrimSpace(cooldownErr.Reason) != "" {
+					message = cooldownErr.Reason
+				}
+				writeError(w, http.StatusTooManyRequests, message, serverErrorType, "rate_limited")
+				return
+			}
 			if lastRateErr != nil {
 				if lastRateErr.RetryAfter > 0 {
 					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", lastRateErr.RetryAfter.Seconds()))
@@ -312,7 +325,14 @@ func (s *Server) proxyChatRequest(
 			return
 		}
 
-		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.name, requestedModel, lease.run.id)
+		s.logger.Printf(
+			"[%s] Routing request (model: %s, premium: %t, session_instance_id: %s) via run: %s",
+			lease.pool.name,
+			requestedModel,
+			s.cfg.RequiresPremiumSession(requestedModel),
+			sessionInstanceID,
+			lease.run.id,
+		)
 
 		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, sessionInstanceID, structuredRetryInstruction)
 		if err != nil {
@@ -367,7 +387,7 @@ func (s *Server) proxyChatRequest(
 			return
 		}
 
-		if isSessionInvalid(resp.StatusCode, errorBody) {
+		if s.cfg.RequiresFreeSession(requestedModel) && isSessionInvalid(resp.StatusCode, errorBody) {
 			s.logger.Printf("%s: free session invalid (status=%d, body=%s), refreshing and retrying", lease.pool.name, resp.StatusCode, strings.TrimSpace(string(errorBody)))
 			lease.pool.invalidateSession(requestedModel, strings.TrimSpace(string(errorBody)))
 			s.runs.Release(lease)
@@ -388,10 +408,10 @@ func (s *Server) proxyChatRequest(
 			if cooldown <= 0 {
 				cooldown = 30 * time.Minute
 			}
-			s.runs.Cooldown(lease, cooldown, rateErr.Error())
+			s.runs.CooldownModel(lease, requestedModel, cooldown, rateErr.Error())
 			lease.pool.invalidateSession(requestedModel, rateErr.Error())
 			s.runs.Release(lease)
-			s.logger.Printf("%s: upstream rate limited token, cooling down for %s and retrying next token", lease.pool.name, cooldown.Round(time.Second))
+			s.logger.Printf("%s: upstream rate limited model %s, cooling down for %s and retrying next token", lease.pool.name, requestedModel, cooldown.Round(time.Second))
 			continue
 		}
 

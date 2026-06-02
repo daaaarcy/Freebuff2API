@@ -66,7 +66,9 @@ Configuration is managed via a JSON file and/or environment variables. The JSON 
   "ROTATION_INTERVAL": "6h",
   "REQUEST_TIMEOUT": "15m",
   "API_KEYS": [],
-  "HTTP_PROXY": ""
+  "HTTP_PROXY": "",
+  "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6"],
+  "PREMIUM_SESSION_MODELS": ["deepseek/deepseek-v4-pro", "moonshotai/kimi-k2.6"]
 }
 ```
 
@@ -81,8 +83,12 @@ Configuration is managed via a JSON file and/or environment variables. The JSON 
 | `REQUEST_TIMEOUT` | Upstream request timeout (default `15m`) |
 | `API_KEYS` | Client API keys for proxy auth (empty = open access) |
 | `HTTP_PROXY` | HTTP proxy for outbound requests |
+| `SESSION_REQUIRED_MODELS` | Models that require the shared Freebuff session instance ID |
+| `PREMIUM_SESSION_MODELS` | Session-required models counted as premium session quota |
 
 Environment variables override JSON values when both are set.
+
+Premium session quota cooldowns are tracked per auth token and model. A 429 for one premium model does not cool down the whole token for other models; 401 auth failures still cool down the whole token. `deepseek/deepseek-v4-flash` is session-required but not premium-counted, so it can reuse any active session instance ID on a token instead of forcing a premium session switch.
 
 ## Deployment
 
