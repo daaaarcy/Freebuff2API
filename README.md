@@ -64,7 +64,7 @@ Configuration is managed via a JSON file and/or environment variables. The JSON 
   "UPSTREAM_BASE_URL": "https://codebuff.com",
   "AUTH_TOKENS": ["eyJhb..."],
   "ROTATION_INTERVAL": "6h",
-  "REQUEST_TIMEOUT": "20m",
+  "REQUEST_TIMEOUT": "30m",
   "API_KEYS": [],
   "HTTP_PROXY": "",
   "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6"],
@@ -80,7 +80,7 @@ Configuration is managed via a JSON file and/or environment variables. The JSON 
 | `UPSTREAM_BASE_URL` | Freebuff backend URL (default `https://codebuff.com`) |
 | `AUTH_TOKENS` | Freebuff auth tokens (JSON array or comma-separated env var) |
 | `ROTATION_INTERVAL` | Run rotation interval (default `6h`) |
-| `REQUEST_TIMEOUT` | Upstream request timeout (default `20m`) |
+| `REQUEST_TIMEOUT` | Upstream request timeout (default `30m`) |
 | `API_KEYS` | Client API keys for proxy auth (empty = open access) |
 | `HTTP_PROXY` | HTTP proxy for outbound requests |
 | `SESSION_REQUIRED_MODELS` | Models that require the shared Freebuff session instance ID |

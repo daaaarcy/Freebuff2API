@@ -64,7 +64,7 @@ npm i -g freebuff
   "UPSTREAM_BASE_URL": "https://codebuff.com",
   "AUTH_TOKENS": ["token"],
   "ROTATION_INTERVAL": "6h",
-  "REQUEST_TIMEOUT": "20m",
+  "REQUEST_TIMEOUT": "30m",
   "API_KEYS": [],
   "HTTP_PROXY": "",
   "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6"],
@@ -80,7 +80,7 @@ npm i -g freebuff
 | `UPSTREAM_BASE_URL` | Freebuff 后端地址（默认 `https://codebuff.com`） |
 | `AUTH_TOKENS` | Freebuff Auth Token（JSON 数组或逗号分隔的环境变量） |
 | `ROTATION_INTERVAL` | Run 自动轮换间隔（默认 `6h`） |
-| `REQUEST_TIMEOUT` | 上游请求超时时间（默认 `20m`） |
+| `REQUEST_TIMEOUT` | 上游请求超时时间（默认 `30m`） |
 | `API_KEYS` | 客户端鉴权 API Key（留空则无需鉴权） |
 | `HTTP_PROXY` | 上游 HTTP 代理地址 |
 | `SESSION_REQUIRED_MODELS` | 需要共享 Freebuff 会话实例 ID 的模型 |
