@@ -22,6 +22,8 @@ const transitionFlashModel = "deepseek/deepseek-v4-flash"
 const transitionFlashAgent = "base2-free-deepseek-flash"
 const transitionKimiModel = "moonshotai/kimi-k2.6"
 const transitionKimiAgent = "base2-free-kimi"
+const transitionMiniMaxModel = "minimax/minimax-m2.7"
+const transitionMiniMaxAgent = "base2-free"
 
 type transitionUpstream struct {
 	t *testing.T
@@ -249,13 +251,17 @@ func newTransitionServerWithLogger(baseURL string, tokens []string, logger *log.
 			transitionTestAgent:  {transitionTestModel},
 			transitionFlashAgent: {transitionFlashModel},
 			transitionKimiAgent:  {transitionKimiModel},
+			transitionMiniMaxAgent: {
+				transitionMiniMaxModel,
+			},
 		},
 		modelToAgent: map[string]string{
-			transitionTestModel:  transitionTestAgent,
-			transitionFlashModel: transitionFlashAgent,
-			transitionKimiModel:  transitionKimiAgent,
+			transitionTestModel:    transitionTestAgent,
+			transitionFlashModel:   transitionFlashAgent,
+			transitionKimiModel:    transitionKimiAgent,
+			transitionMiniMaxModel: transitionMiniMaxAgent,
 		},
-		allModels: []string{transitionTestModel, transitionFlashModel, transitionKimiModel},
+		allModels: []string{transitionTestModel, transitionFlashModel, transitionKimiModel, transitionMiniMaxModel},
 	}
 	return &Server{
 		cfg:      cfg,
@@ -586,19 +592,96 @@ func TestProxyChatRateLimitCoolsOnlyRequestedModel(t *testing.T) {
 }
 
 func TestInjectUpstreamMetadataTranslatesJSONSchemaResponseFormat(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		model string
+	}{
+		{name: "deepseek pro", model: transitionTestModel},
+		{name: "deepseek flash", model: transitionFlashModel},
+		{name: "kimi", model: transitionKimiModel},
+		{name: "unknown", model: "unknown/future-model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTransitionServer("http://example.invalid", []string{"token-1"})
+			payload := map[string]any{
+				"model": tc.model,
+				"messages": []any{
+					map[string]any{"role": "user", "content": "return the ticker"},
+				},
+				"response_format": map[string]any{
+					"type": "json_schema",
+					"json_schema": map[string]any{
+						"name": "ticker_response",
+						"schema": map[string]any{
+							"type":     "object",
+							"required": []any{"ticker"},
+							"properties": map[string]any{
+								"ticker": map[string]any{"type": "string"},
+							},
+						},
+					},
+				},
+			}
+
+			body, err := server.injectUpstreamMetadata(payload, tc.model, "run-1", "session-1")
+			if err != nil {
+				t.Fatalf("inject metadata: %v", err)
+			}
+
+			var forwarded map[string]any
+			if err := json.Unmarshal(body, &forwarded); err != nil {
+				t.Fatalf("decode forwarded body: %v", err)
+			}
+			responseFormat := mapValue(forwarded["response_format"])
+			if got := stringValue(responseFormat["type"]); got != "json_object" {
+				t.Fatalf("forwarded response_format.type = %q, want json_object", got)
+			}
+			if _, exists := responseFormat["json_schema"]; exists {
+				t.Fatalf("forwarded response_format json_schema = %#v, want stripped for upstream compatibility", responseFormat["json_schema"])
+			}
+			messages := sliceValue(forwarded["messages"])
+			if len(messages) != 2 {
+				t.Fatalf("messages len = %d, want 2", len(messages))
+			}
+			systemMessage := mapValue(messages[0])
+			if got := stringValue(systemMessage["role"]); got != "system" {
+				t.Fatalf("first message role = %q, want system", got)
+			}
+			content := stringValue(systemMessage["content"])
+			if !strings.Contains(content, "valid JSON object") || !strings.Contains(content, `"ticker"`) {
+				t.Fatalf("system instruction = %q, want JSON object instruction containing schema", content)
+			}
+			if originalMessages := sliceValue(payload["messages"]); stringValue(mapValue(originalMessages[0])["role"]) != "user" {
+				t.Fatalf("original payload messages mutated: %#v", payload["messages"])
+			}
+			if _, stillExists := mapValue(payload["response_format"])["json_schema"]; !stillExists {
+				t.Fatalf("original response_format mutated: %#v", payload["response_format"])
+			}
+		})
+	}
+}
+
+func TestInjectUpstreamMetadataPreservesMiniMaxJSONSchemaResponseFormat(t *testing.T) {
 	server := newTransitionServer("http://example.invalid", []string{"token-1"})
 	payload := map[string]any{
-		"model": transitionTestModel,
+		"model": transitionMiniMaxModel,
 		"messages": []any{
 			map[string]any{"role": "user", "content": "return the ticker"},
+		},
+		"reasoning_effort": "high",
+		"thinking":         map[string]any{"type": "disabled"},
+		"extra_body": map[string]any{
+			"thinking": map[string]any{"type": "enabled"},
 		},
 		"response_format": map[string]any{
 			"type": "json_schema",
 			"json_schema": map[string]any{
-				"name": "ticker_response",
+				"name":   "ticker_response",
+				"strict": true,
 				"schema": map[string]any{
-					"type":     "object",
-					"required": []any{"ticker"},
+					"type":                 "object",
+					"additionalProperties": false,
+					"required":             []any{"ticker"},
 					"properties": map[string]any{
 						"ticker": map[string]any{"type": "string"},
 					},
@@ -607,7 +690,7 @@ func TestInjectUpstreamMetadataTranslatesJSONSchemaResponseFormat(t *testing.T) 
 		},
 	}
 
-	body, err := server.injectUpstreamMetadata(payload, transitionTestModel, "run-1", "session-1")
+	body, err := server.injectUpstreamMetadata(payload, transitionMiniMaxModel, "run-1", "session-1")
 	if err != nil {
 		t.Fatalf("inject metadata: %v", err)
 	}
@@ -617,29 +700,49 @@ func TestInjectUpstreamMetadataTranslatesJSONSchemaResponseFormat(t *testing.T) 
 		t.Fatalf("decode forwarded body: %v", err)
 	}
 	responseFormat := mapValue(forwarded["response_format"])
-	if got := stringValue(responseFormat["type"]); got != "json_object" {
-		t.Fatalf("forwarded response_format.type = %q, want json_object", got)
+	if got := stringValue(responseFormat["type"]); got != "json_schema" {
+		t.Fatalf("forwarded response_format.type = %q, want json_schema", got)
 	}
-	if _, exists := responseFormat["json_schema"]; exists {
-		t.Fatalf("forwarded response_format json_schema = %#v, want stripped for upstream compatibility", responseFormat["json_schema"])
+	jsonSchema := mapValue(responseFormat["json_schema"])
+	if got := stringValue(jsonSchema["name"]); got != "ticker_response" {
+		t.Fatalf("forwarded json_schema.name = %q, want ticker_response", got)
+	}
+	if got := boolValue(jsonSchema["strict"]); !got {
+		t.Fatalf("forwarded json_schema.strict = %t, want true", got)
+	}
+	schema := mapValue(jsonSchema["schema"])
+	if got := stringValue(schema["type"]); got != "object" {
+		t.Fatalf("forwarded schema.type = %q, want object", got)
 	}
 	messages := sliceValue(forwarded["messages"])
 	if len(messages) != 2 {
-		t.Fatalf("messages len = %d, want 2", len(messages))
+		t.Fatalf("messages len = %d, want injected schema instruction", len(messages))
 	}
 	systemMessage := mapValue(messages[0])
 	if got := stringValue(systemMessage["role"]); got != "system" {
 		t.Fatalf("first message role = %q, want system", got)
 	}
 	content := stringValue(systemMessage["content"])
-	if !strings.Contains(content, "valid JSON object") || !strings.Contains(content, `"ticker"`) {
-		t.Fatalf("system instruction = %q, want JSON object instruction containing schema", content)
+	if !strings.Contains(content, "matching this JSON schema") || !strings.Contains(content, `"ticker"`) {
+		t.Fatalf("system instruction = %q, want JSON schema instruction", content)
 	}
-	if originalMessages := sliceValue(payload["messages"]); stringValue(mapValue(originalMessages[0])["role"]) != "user" {
-		t.Fatalf("original payload messages mutated: %#v", payload["messages"])
+	if _, exists := forwarded["thinking"]; exists {
+		t.Fatalf("forwarded thinking = %#v, want omitted for MiniMax strict schema path", forwarded["thinking"])
+	}
+	if _, exists := forwarded["reasoning_effort"]; exists {
+		t.Fatalf("forwarded reasoning_effort = %#v, want omitted for MiniMax strict schema path", forwarded["reasoning_effort"])
+	}
+	if _, exists := forwarded["extra_body"]; exists {
+		t.Fatalf("forwarded extra_body = %#v, want omitted for MiniMax strict schema path", forwarded["extra_body"])
 	}
 	if _, stillExists := mapValue(payload["response_format"])["json_schema"]; !stillExists {
 		t.Fatalf("original response_format mutated: %#v", payload["response_format"])
+	}
+	if _, stillExists := payload["thinking"]; !stillExists {
+		t.Fatalf("original thinking mutated: %#v", payload)
+	}
+	if _, stillExists := mapValue(payload["extra_body"])["thinking"]; !stillExists {
+		t.Fatalf("original extra_body mutated: %#v", payload["extra_body"])
 	}
 }
 

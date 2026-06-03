@@ -42,11 +42,14 @@ var defaultSessionRequiredModels = []string{
 	"deepseek/deepseek-v4-flash",
 	"minimax/minimax-m2.7",
 	"moonshotai/kimi-k2.6",
+	"mimo/mimo-v2.5",
+	"mimo/mimo-v2.5-pro",
 }
 
 var defaultPremiumSessionModels = []string{
 	"deepseek/deepseek-v4-pro",
 	"moonshotai/kimi-k2.6",
+	"mimo/mimo-v2.5-pro",
 }
 
 func loadConfig(configPath string) (Config, error) {

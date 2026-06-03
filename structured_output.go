@@ -104,7 +104,7 @@ func validateResponseFormatSchema(responseFormat structuredResponseFormat) error
 	return nil
 }
 
-func normalizeResponseFormatForUpstream(payload map[string]any) error {
+func normalizeResponseFormatForUpstream(payload map[string]any, requestedModel string) error {
 	responseFormat, err := parseResponseFormat(payload["response_format"])
 	if err != nil {
 		return err
@@ -113,11 +113,45 @@ func normalizeResponseFormatForUpstream(payload map[string]any) error {
 	switch responseFormat.Kind {
 	case responseFormatNone, responseFormatText:
 		delete(payload, "response_format")
-	case responseFormatJSONObject, responseFormatJSONSchema:
+	case responseFormatJSONObject:
+		payload["response_format"] = map[string]any{"type": string(responseFormatJSONObject)}
+		prependSystemInstruction(payload, responseFormat.JSONInstruction())
+	case responseFormatJSONSchema:
+		if supportsStrictJSONSchemaResponseFormat(requestedModel) {
+			prependSystemInstruction(payload, responseFormat.JSONInstruction())
+			stripStructuredResponseIncompatibleControls(payload)
+			return nil
+		}
 		payload["response_format"] = map[string]any{"type": string(responseFormatJSONObject)}
 		prependSystemInstruction(payload, responseFormat.JSONInstruction())
 	}
 	return nil
+}
+
+func supportsStrictJSONSchemaResponseFormat(model string) bool {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "minimax/minimax-m2.7", "minimax-m2.7":
+		return true
+	default:
+		return false
+	}
+}
+
+func stripStructuredResponseIncompatibleControls(payload map[string]any) {
+	delete(payload, "reasoning")
+	delete(payload, "reasoning_effort")
+	delete(payload, "thinking")
+
+	extraBody := mapValue(payload["extra_body"])
+	if extraBody == nil {
+		return
+	}
+	delete(extraBody, "reasoning")
+	delete(extraBody, "reasoning_effort")
+	delete(extraBody, "thinking")
+	if len(extraBody) == 0 {
+		delete(payload, "extra_body")
+	}
 }
 
 type structuredOutputValidationError struct {

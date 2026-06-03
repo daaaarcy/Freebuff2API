@@ -488,7 +488,7 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 	if tools, ok := cloned["tools"].([]any); ok {
 		normalizeToolSchemas(tools)
 	}
-	if err := normalizeResponseFormatForUpstream(cloned); err != nil {
+	if err := normalizeResponseFormatForUpstream(cloned, requestedModel); err != nil {
 		return nil, err
 	}
 	if len(retryInstructions) > 0 {

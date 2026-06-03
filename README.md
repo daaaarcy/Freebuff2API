@@ -67,8 +67,8 @@ Configuration is managed via a JSON file and/or environment variables. The JSON 
   "REQUEST_TIMEOUT": "30m",
   "API_KEYS": [],
   "HTTP_PROXY": "",
-  "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6"],
-  "PREMIUM_SESSION_MODELS": ["deepseek/deepseek-v4-pro", "moonshotai/kimi-k2.6"]
+  "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6", "mimo/mimo-v2.5", "mimo/mimo-v2.5-pro"],
+  "PREMIUM_SESSION_MODELS": ["deepseek/deepseek-v4-pro", "moonshotai/kimi-k2.6", "mimo/mimo-v2.5-pro"]
 }
 ```
 
@@ -88,7 +88,7 @@ Configuration is managed via a JSON file and/or environment variables. The JSON 
 
 Environment variables override JSON values when both are set.
 
-Premium session quota cooldowns are tracked per auth token and model. A 429 for one premium model does not cool down the whole token for other models; 401 auth failures still cool down the whole token. `deepseek/deepseek-v4-flash` is session-required but not premium-counted, so it can reuse any active session instance ID on a token instead of forcing a premium session switch.
+Premium session quota cooldowns are tracked per auth token and model. A 429 for one premium model does not cool down the whole token for other models; 401 auth failures still cool down the whole token. `deepseek/deepseek-v4-flash` and `mimo/mimo-v2.5` are session-required but not premium-counted, so they can reuse any active session instance ID on a token instead of forcing a premium session switch.
 
 ## Deployment
 

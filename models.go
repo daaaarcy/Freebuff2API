@@ -22,21 +22,37 @@ const (
 
 // hardcodedFallback is used when the remote fetch fails on startup.
 var hardcodedFallback = map[string][]string{
-	"base2-free":              {"minimax/minimax-m2.7", "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "moonshotai/kimi-k2.6"},
-	"base2-free-kimi":         {"moonshotai/kimi-k2.6"},
-	"base2-free-deepseek":     {"deepseek/deepseek-v4-pro"},
-	"base2-free-deepseek-flash": {"deepseek/deepseek-v4-flash"},
-	"file-picker":             {"google/gemini-2.5-flash-lite"},
-	"file-picker-max":         {"google/gemini-3.1-flash-lite-preview"},
-	"file-lister":             {"google/gemini-3.1-flash-lite-preview"},
-	"researcher-web":          {"google/gemini-3.1-flash-lite-preview"},
-	"researcher-docs":         {"google/gemini-3.1-flash-lite-preview"},
-	"basher":                  {"google/gemini-3.1-flash-lite-preview"},
-	"code-reviewer-minimax":   {"minimax/minimax-m2.7"},
-	"code-reviewer-kimi":      {"moonshotai/kimi-k2.6"},
-	"code-reviewer-deepseek":  {"deepseek/deepseek-v4-pro"},
+	"base2-free":                   {"minimax/minimax-m2.7", "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "moonshotai/kimi-k2.6"},
+	"base2-free-kimi":              {"moonshotai/kimi-k2.6"},
+	"base2-free-deepseek":          {"deepseek/deepseek-v4-pro"},
+	"base2-free-deepseek-flash":    {"deepseek/deepseek-v4-flash"},
+	"base2-free-mimo":              {"mimo/mimo-v2.5"},
+	"base2-free-mimo-pro":          {"mimo/mimo-v2.5-pro"},
+	"file-picker":                  {"google/gemini-2.5-flash-lite"},
+	"file-picker-max":              {"google/gemini-3.1-flash-lite-preview"},
+	"file-lister":                  {"google/gemini-3.1-flash-lite-preview"},
+	"researcher-web":               {"google/gemini-3.1-flash-lite-preview"},
+	"researcher-docs":              {"google/gemini-3.1-flash-lite-preview"},
+	"basher":                       {"google/gemini-3.1-flash-lite-preview"},
+	"code-reviewer-minimax":        {"minimax/minimax-m2.7"},
+	"code-reviewer-kimi":           {"moonshotai/kimi-k2.6"},
+	"code-reviewer-deepseek":       {"deepseek/deepseek-v4-pro"},
 	"code-reviewer-deepseek-flash": {"deepseek/deepseek-v4-flash"},
-	"code-reviewer-lite":      {"minimax/minimax-m2.7", "moonshotai/kimi-k2.6", "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"},
+	"code-reviewer-mimo":           {"mimo/mimo-v2.5"},
+	"code-reviewer-mimo-pro":       {"mimo/mimo-v2.5-pro"},
+	"code-reviewer-lite":           {"minimax/minimax-m2.7", "moonshotai/kimi-k2.6", "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "mimo/mimo-v2.5-pro", "mimo/mimo-v2.5"},
+}
+
+var builtInFreebuffModels = map[string][]string{
+	"base2-free-mimo":        {"mimo/mimo-v2.5"},
+	"base2-free-mimo-pro":    {"mimo/mimo-v2.5-pro"},
+	"code-reviewer-mimo":     {"mimo/mimo-v2.5"},
+	"code-reviewer-mimo-pro": {"mimo/mimo-v2.5-pro"},
+}
+
+var builtInRootAgentIDs = map[string]bool{
+	"base2-free-mimo":     true,
+	"base2-free-mimo-pro": true,
 }
 
 // ModelRegistry fetches and caches the agent→model mapping for all free agents
@@ -147,13 +163,14 @@ func (r *ModelRegistry) refresh(ctx context.Context) error {
 
 	// Update root agent IDs from upstream source
 	if parsed := parseRootAgentIDs(agentsSrc); len(parsed) > 0 {
-		rootAgentIDs = parsed
+		rootAgentIDs = mergeBuiltInRootAgentIDs(parsed)
 	}
 
 	all := parseAllFreeModels(agentsSrc, constants)
 	if len(all) == 0 {
 		return fmt.Errorf("no free agents found in source")
 	}
+	all = mergeBuiltInFreebuffModels(all)
 
 	modelToAgent, allModels := buildModelMapping(all)
 
@@ -193,10 +210,11 @@ func (r *ModelRegistry) fetchSource(ctx context.Context, url string) (string, er
 }
 
 func (r *ModelRegistry) loadFallback() {
-	modelToAgent, allModels := buildModelMapping(hardcodedFallback)
+	all := mergeBuiltInFreebuffModels(hardcodedFallback)
+	modelToAgent, allModels := buildModelMapping(all)
 
 	r.mu.Lock()
-	r.agentModels = hardcodedFallback
+	r.agentModels = all
 	r.modelToAgent = modelToAgent
 	r.allModels = allModels
 	r.mu.Unlock()
@@ -268,10 +286,44 @@ func parseAllFreeModels(source string, constants map[string]string) map[string][
 // Non-root agents (reviewers, subagents) require an active root ancestor run.
 // We prefer mapping models to root agents to avoid hierarchy rejections.
 var rootAgentIDs = map[string]bool{
-	"base2-free":              true,
-	"base2-free-kimi":         true,
-	"base2-free-deepseek":     true,
+	"base2-free":                true,
+	"base2-free-kimi":           true,
+	"base2-free-deepseek":       true,
 	"base2-free-deepseek-flash": true,
+	"base2-free-mimo":           true,
+	"base2-free-mimo-pro":       true,
+}
+
+func mergeBuiltInFreebuffModels(agentModels map[string][]string) map[string][]string {
+	merged := make(map[string][]string, len(agentModels)+len(builtInFreebuffModels))
+	for agentID, models := range agentModels {
+		merged[agentID] = append([]string(nil), models...)
+	}
+	for agentID, models := range builtInFreebuffModels {
+		merged[agentID] = appendMissingStrings(merged[agentID], models...)
+	}
+	return merged
+}
+
+func mergeBuiltInRootAgentIDs(ids map[string]bool) map[string]bool {
+	merged := make(map[string]bool, len(ids)+len(builtInRootAgentIDs))
+	for id, isRoot := range ids {
+		merged[id] = isRoot
+	}
+	for id, isRoot := range builtInRootAgentIDs {
+		merged[id] = isRoot
+	}
+	return merged
+}
+
+func appendMissingStrings(values []string, additions ...string) []string {
+	out := append([]string(nil), values...)
+	for _, addition := range additions {
+		if !containsString(out, addition) {
+			out = append(out, addition)
+		}
+	}
+	return out
 }
 
 // buildModelMapping creates the model→agent reverse mapping and deduplicated model list.

@@ -67,8 +67,8 @@ Upstream (www.codebuff.com)
   "REQUEST_TIMEOUT": "30m",
   "API_KEYS": ["optional-client-facing-key"],
   "HTTP_PROXY": "",
-  "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6"],
-  "PREMIUM_SESSION_MODELS": ["deepseek/deepseek-v4-pro", "moonshotai/kimi-k2.6"]
+  "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6", "mimo/mimo-v2.5", "mimo/mimo-v2.5-pro"],
+  "PREMIUM_SESSION_MODELS": ["deepseek/deepseek-v4-pro", "moonshotai/kimi-k2.6", "mimo/mimo-v2.5-pro"]
 }
 ```
 
@@ -78,7 +78,7 @@ All fields overrideable by env vars of the same name. `AUTH_TOKENS`, `API_KEYS`,
 
 One `tokenPool` per `AUTH_TOKEN`. **Sequential failover, not round-robin:**
 
-1. **Only pool 0 (token-1) prewarms** on startup — creates runs for all 16 agents
+1. **Only pool 0 (token-1) prewarms** on startup — creates runs for all public registry agents plus built-in executable-discovered agents
 2. **Backup pools stay idle** — no runs, no premium sessions, until needed
 3. **Requests always try pool 0 first** — if it succeeds, done
 4. **On session acquisition 429** — that token/model pair enters cooldown until `resetAt`/`Retry-After`, try next pool
@@ -114,17 +114,17 @@ Fetches two TypeScript source files from GitHub every 6 hours:
 - `freebuff-models.ts` — model constant definitions
 
 Root agents (preferred for serving):
-- `base2-free`, `base2-free-kimi`, `base2-free-deepseek`, `base2-free-deepseek-flash`
+- `base2-free`, `base2-free-kimi`, `base2-free-deepseek`, `base2-free-deepseek-flash`, `base2-free-mimo`, `base2-free-mimo-pro`
 
 Non-root agents (code-reviewer-*, file-picker, etc.) are excluded from the public model list — they require an active root ancestor run.
 
-Falls back to `hardcodedFallback` map if upstream fetch fails.
+Falls back to `hardcodedFallback` map if upstream fetch fails. The registry also merges executable-discovered MiMo agents (`mimo/mimo-v2.5`, `mimo/mimo-v2.5-pro`) into fetched mappings until the public GitHub sources catch up.
 
 ## Session Management
 
-Only models listed in `SESSION_REQUIRED_MODELS` use `/api/v1/freebuff/session`. Defaults are the current public Freebuff model IDs: `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`, `minimax/minimax-m2.7`, and `moonshotai/kimi-k2.6`.
+Only models listed in `SESSION_REQUIRED_MODELS` use `/api/v1/freebuff/session`. Defaults are the current Freebuff model IDs: `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`, `minimax/minimax-m2.7`, `moonshotai/kimi-k2.6`, `mimo/mimo-v2.5`, and `mimo/mimo-v2.5-pro`.
 
-Only models listed in `PREMIUM_SESSION_MODELS` are counted as premium session models. Defaults: `deepseek/deepseek-v4-pro` and `moonshotai/kimi-k2.6`.
+Only models listed in `PREMIUM_SESSION_MODELS` are counted as premium session models. Defaults: `deepseek/deepseek-v4-pro`, `moonshotai/kimi-k2.6`, and `mimo/mimo-v2.5-pro`.
 
 Freebuff sessions are **per-pool shared sessions** (`session *cachedSession`), not per-model sessions.
 
