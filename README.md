@@ -115,7 +115,7 @@ docker run -d -p 8080:8080 -e AUTH_TOKENS="token1,token2" Freebuff2API
 **Requirements:** Go 1.23+
 
 ```bash
-git clone https://github.com/Quorinex/Freebuff2API.git
+git clone https://github.com/daaaarcy/Freebuff2API.git
 cd Freebuff2API
 go build -o Freebuff2API .
 ./Freebuff2API -config config.json

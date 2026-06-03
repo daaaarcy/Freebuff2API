@@ -1,4 +1,4 @@
-module github.com/Quorinex/Freebuff2API
+module github.com/daaaarcy/Freebuff2API
 
 go 1.23.0
 

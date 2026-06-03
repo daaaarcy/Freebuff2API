@@ -9,7 +9,7 @@ OpenAI- and Anthropic-compatible proxy for Codebuff's free-tier models. Translat
 - **Port:** `:9993` (deployment), `:8080` (default config)
 - **Config:** `config.json` (gitignored), env vars override all fields
 - **License:** MIT
-- **Upstream fork:** `origin` = Quorinex/upstream, `fork` = daaaarcy/Freebuff2API — push to `fork`
+- **GitHub remote:** `origin` = daaaarcy/Freebuff2API — never push to the former upstream project from this workspace
 
 ## Architecture
 
