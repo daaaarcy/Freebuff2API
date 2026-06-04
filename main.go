@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -16,7 +17,8 @@ func main() {
 	configPath := flag.String("config", "", "path to a JSON config file (default: config.json if present)")
 	flag.Parse()
 
-	logger := log.New(os.Stdout, "[Freebuff2API] ", log.LstdFlags|log.Lmsgprefix)
+	logs := newLogBuffer(defaultDashboardLogLines)
+	logger := log.New(io.MultiWriter(os.Stdout, logs), "[Freebuff2API] ", log.LstdFlags|log.Lmsgprefix)
 
 	// Auto-detect config.json in CWD when no flag is given
 	if *configPath == "" {
@@ -36,12 +38,12 @@ func main() {
 		transport.Proxy = http.ProxyURL(importURL)
 	}
 	httpClient := &http.Client{Transport: transport, Timeout: 15 * time.Second}
-	
+
 	registry := NewModelRegistry(httpClient, logger)
 	registry.Start(context.Background())
 	defer registry.Stop()
 
-	server := NewServer(cfg, logger, registry)
+	server := NewServerWithLogBuffer(cfg, logger, registry, logs)
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
 	server.Start(runCtx)

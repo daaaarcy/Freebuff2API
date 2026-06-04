@@ -19,10 +19,15 @@ type Server struct {
 	client   *UpstreamClient
 	runs     *RunManager
 	registry *ModelRegistry
+	logs     *logBuffer
 	started  time.Time
 }
 
 func NewServer(cfg Config, logger *log.Logger, registry *ModelRegistry) *Server {
+	return NewServerWithLogBuffer(cfg, logger, registry, nil)
+}
+
+func NewServerWithLogBuffer(cfg Config, logger *log.Logger, registry *ModelRegistry, logs *logBuffer) *Server {
 	client := NewUpstreamClient(cfg)
 	runManager := NewRunManager(cfg, client, logger)
 
@@ -32,18 +37,34 @@ func NewServer(cfg Config, logger *log.Logger, registry *ModelRegistry) *Server 
 		client:   client,
 		runs:     runManager,
 		registry: registry,
+		logs:     logs,
 		started:  time.Now(),
 	}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/dashboard", s.handleDashboard)
+	mux.HandleFunc("/dashboard/", s.handleDashboard)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("/v1/messages", s.handleClaudeMessages)
 	mux.HandleFunc("/v1/messages/count_tokens", s.handleClaudeCountTokens)
 	return s.withMiddleware(mux)
+}
+
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
+		return
+	}
+	http.Redirect(w, r, "/dashboard/", http.StatusFound)
 }
 
 func (s *Server) Start(ctx context.Context) {

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Freebuff2API Dashboard</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/dashboard/style.css">
+</head>
+<body>
+  <div class="dashboard-shell">
+    <header class="topbar">
+      <div>
+        <h1>Freebuff2API</h1>
+        <p id="subtitle">Loading service state</p>
+      </div>
+      <div class="topbar-actions">
+        <button id="refresh-button" type="button">Refresh</button>
+        <button id="pause-button" type="button">Pause</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="metrics-grid" aria-label="Service summary">
+        <article class="metric">
+          <span>Service</span>
+          <strong id="metric-service">--</strong>
+        </article>
+        <article class="metric">
+          <span>Tokens</span>
+          <strong id="metric-tokens">--</strong>
+        </article>
+        <article class="metric">
+          <span>Sessions</span>
+          <strong id="metric-sessions">--</strong>
+        </article>
+        <article class="metric">
+          <span>Runs</span>
+          <strong id="metric-runs">--</strong>
+        </article>
+        <article class="metric">
+          <span>Inflight</span>
+          <strong id="metric-inflight">--</strong>
+        </article>
+        <article class="metric">
+          <span>Cooling</span>
+          <strong id="metric-cooling">--</strong>
+        </article>
+        <article class="metric">
+          <span>Session Starts 24h</span>
+          <strong id="metric-session-starts">--</strong>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Token Pool</h2>
+          <span id="refresh-status">Waiting for data</span>
+        </div>
+        <div id="token-board" class="token-board"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Transition Timeline</h2>
+          <span id="transition-window">--</span>
+        </div>
+        <div id="timeline" class="timeline"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Active Sessions</h2>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Token</th>
+                <th>Session</th>
+                <th>Model</th>
+                <th>Premium</th>
+                <th>Remaining</th>
+                <th>Transition</th>
+                <th>Slot 24h</th>
+              </tr>
+            </thead>
+            <tbody id="sessions-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="split-grid">
+        <article class="panel">
+          <div class="panel-heading">
+            <h2>Models</h2>
+          </div>
+          <div id="models" class="model-list"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h2>Config</h2>
+          </div>
+          <dl id="config-list" class="config-list"></dl>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Runs</h2>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Token</th>
+                <th>Agent</th>
+                <th>Run</th>
+                <th>Age</th>
+                <th>Inflight</th>
+                <th>Requests</th>
+              </tr>
+            </thead>
+            <tbody id="runs-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Freebuff2API Log</h2>
+          <span id="log-count">--</span>
+        </div>
+        <pre id="log-lines"></pre>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Raw Dashboard State</h2>
+        </div>
+        <pre id="raw-json">{}</pre>
+      </section>
+    </main>
+  </div>
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>

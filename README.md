@@ -123,6 +123,12 @@ go build -o Freebuff2API .
 ./Freebuff2API -config config.json
 ```
 
+## Dashboard
+
+`GET /dashboard/` serves a read-only operator dashboard on the same port as the API. It visualizes service health, model routing, token fingerprints, run counts, session status, transition mode, cooldowns, and redacted configuration. If `API_KEYS` is configured, the dashboard requires the same `x-api-key` or `Authorization: Bearer` credential as the API.
+
+`GET /dashboard/api/state` returns the dashboard JSON payload. Raw `AUTH_TOKENS`, `API_KEYS`, proxy credentials, and full session instance IDs are not exposed.
+
 ## Links
 
 - [linux.do](https://linux.do)

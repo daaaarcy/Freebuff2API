@@ -311,6 +311,12 @@ func (p *tokenPool) recordSessionStartLocked(session *cachedSession) {
 		p.sessionStartedCounts = make(map[string]int)
 	}
 	p.sessionStartedCounts[model]++
+	now := time.Now()
+	p.sessionStartEvents = append(p.sessionStartEvents, sessionStartEvent{
+		model:     model,
+		startedAt: now,
+	})
+	p.pruneSessionStartEventsLocked(now)
 	p.logger.Printf(
 		"%s: free session active model=%s premium=%t instance_id=%s expires_at=%s session_start_count=%d",
 		p.name,
@@ -320,6 +326,35 @@ func (p *tokenPool) recordSessionStartLocked(session *cachedSession) {
 		session.expiresAt.Format(time.RFC3339),
 		p.sessionStartedCounts[model],
 	)
+}
+
+func (p *tokenPool) pruneSessionStartEventsLocked(now time.Time) {
+	cutoff := now.Add(-24 * time.Hour)
+	writeIndex := 0
+	for _, event := range p.sessionStartEvents {
+		if event.startedAt.IsZero() || event.startedAt.Before(cutoff) {
+			continue
+		}
+		p.sessionStartEvents[writeIndex] = event
+		writeIndex++
+	}
+	p.sessionStartEvents = p.sessionStartEvents[:writeIndex]
+}
+
+func (p *tokenPool) sessionStartsLast24hLocked(now time.Time) (int, map[string]int) {
+	p.pruneSessionStartEventsLocked(now)
+	byModel := make(map[string]int)
+	for _, event := range p.sessionStartEvents {
+		model := strings.TrimSpace(event.model)
+		if model == "" {
+			model = "unknown"
+		}
+		byModel[model]++
+	}
+	if len(byModel) == 0 {
+		return 0, nil
+	}
+	return len(p.sessionStartEvents), byModel
 }
 
 func (p *tokenPool) refreshSession(ctx context.Context, agentID, model string) (*cachedSession, string, error) {

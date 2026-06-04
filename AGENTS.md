@@ -19,6 +19,8 @@ Client (OpenAI / Claude format)
   ▼
 Server (server.go) ── API key auth middleware
   ├── /healthz                 → RunManager.Snapshots()
+  ├── /dashboard/              → read-only operator dashboard
+  ├── /dashboard/api/state     → redacted dashboard state
   ├── /v1/models               → ModelRegistry.Models()
   ├── /v1/chat/completions     → proxyChatRequest()
   ├── /v1/messages             → Claude→OpenAI convert → proxyChatRequest()
@@ -50,6 +52,7 @@ Upstream (www.codebuff.com)
 | `free_session.go` | Free session lifecycle (create/poll/end/invalidate), waiting room, rate limit parsing |
 | `run_manager.go` | `RunManager` + `tokenPool` — run rotation, cooldown, failover, prewarming, maintenance |
 | `server.go` | HTTP handlers, middleware, proxy logic, tool schema normalization, error formatting |
+| `dashboard.go` + `web/dashboard/` | Same-port read-only dashboard and redacted dashboard state |
 | `anthropic.go` | Claude↔OpenAI bidirectional format conversion (streaming + non-streaming) |
 | `token_count.go` | Token counting via tiktoken for `/v1/messages/count_tokens` |
 | `*_test.go` | Regression tests for session expiry, waiting-room/rate-limit aggregation, and auth-token failover |

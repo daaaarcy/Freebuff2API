@@ -33,6 +33,7 @@ type tokenPool struct {
 	sessionRefreshCh     chan struct{}
 	sessionInflight      int
 	sessionStartedCounts map[string]int
+	sessionStartEvents   []sessionStartEvent
 	passiveTransitionLog map[string]bool
 	lastError            string
 	cooldownUntil        time.Time
@@ -42,6 +43,11 @@ type tokenPool struct {
 type modelCooldown struct {
 	Until  time.Time
 	Reason string
+}
+
+type sessionStartEvent struct {
+	model     string
+	startedAt time.Time
 }
 
 type managedRun struct {
@@ -60,25 +66,27 @@ type runLease struct {
 }
 
 type tokenSnapshot struct {
-	Name                  string                  `json:"name"`
-	Runs                  []runSnapshot           `json:"runs"`
-	DrainingRuns          int                     `json:"draining_runs"`
-	SessionStatus         string                  `json:"session_status,omitempty"`
-	SessionModel          string                  `json:"session_model,omitempty"`
-	SessionPremium        bool                    `json:"session_premium"`
-	SessionInstanceID     string                  `json:"session_instance_id,omitempty"`
-	SessionExpiresAt      time.Time               `json:"session_expires_at,omitempty"`
-	SessionRemainingMs    int64                   `json:"session_remaining_ms,omitempty"`
-	SessionTransitioning  bool                    `json:"session_transitioning"`
-	SessionTransitionMode string                  `json:"session_transition_mode,omitempty"`
-	SessionPosition       int                     `json:"session_position,omitempty"`
-	SessionQueueDepth     int                     `json:"session_queue_depth,omitempty"`
-	SessionPollAt         time.Time               `json:"session_poll_at,omitempty"`
-	SessionInflight       int                     `json:"session_inflight,omitempty"`
-	SessionStartedCounts  map[string]int          `json:"session_started_counts,omitempty"`
-	CooldownUntil         time.Time               `json:"cooldown_until,omitempty"`
-	ModelCooldowns        []modelCooldownSnapshot `json:"model_cooldowns,omitempty"`
-	LastError             string                  `json:"last_error,omitempty"`
+	Name                        string                  `json:"name"`
+	Runs                        []runSnapshot           `json:"runs"`
+	DrainingRuns                int                     `json:"draining_runs"`
+	SessionStatus               string                  `json:"session_status,omitempty"`
+	SessionModel                string                  `json:"session_model,omitempty"`
+	SessionPremium              bool                    `json:"session_premium"`
+	SessionInstanceID           string                  `json:"session_instance_id,omitempty"`
+	SessionExpiresAt            time.Time               `json:"session_expires_at,omitempty"`
+	SessionRemainingMs          int64                   `json:"session_remaining_ms,omitempty"`
+	SessionTransitioning        bool                    `json:"session_transitioning"`
+	SessionTransitionMode       string                  `json:"session_transition_mode,omitempty"`
+	SessionPosition             int                     `json:"session_position,omitempty"`
+	SessionQueueDepth           int                     `json:"session_queue_depth,omitempty"`
+	SessionPollAt               time.Time               `json:"session_poll_at,omitempty"`
+	SessionInflight             int                     `json:"session_inflight,omitempty"`
+	SessionStartedCounts        map[string]int          `json:"session_started_counts,omitempty"`
+	SessionStartsLast24h        int                     `json:"session_starts_last_24h,omitempty"`
+	SessionStartsLast24hByModel map[string]int          `json:"session_starts_last_24h_by_model,omitempty"`
+	CooldownUntil               time.Time               `json:"cooldown_until,omitempty"`
+	ModelCooldowns              []modelCooldownSnapshot `json:"model_cooldowns,omitempty"`
+	LastError                   string                  `json:"last_error,omitempty"`
 }
 
 type modelCooldownSnapshot struct {
@@ -831,6 +839,7 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 			snapshot.SessionStartedCounts[model] = count
 		}
 	}
+	snapshot.SessionStartsLast24h, snapshot.SessionStartsLast24hByModel = p.sessionStartsLast24hLocked(now)
 	for agentID, run := range p.runs {
 		snapshot.Runs = append(snapshot.Runs, runSnapshot{
 			AgentID:      agentID,
