@@ -344,6 +344,166 @@ func TestProxySharesOneSessionAcrossSamePremiumModelRequests(t *testing.T) {
 	}
 }
 
+func TestProxyRoutesTransitionPeriodRequestToWarmedNextSession(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	upstream.sessions["token-1"] = []freeSessionResponse{{
+		Status:     string(sessionStatusActive),
+		InstanceID: "token-1-expiring",
+		ExpiresAt:  time.Now().Add(9 * time.Minute).UTC().Format(time.RFC3339),
+	}}
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1", "token-2"})
+
+	first := performChatRequest(t, server)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, body = %s, want 200", first.Code, first.Body.String())
+	}
+
+	second := performChatRequest(t, server)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, body = %s, want 200", second.Code, second.Body.String())
+	}
+
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1,token-2"; got != want {
+		t.Fatalf("session requests = %s, want expiring token-1 then warmed token-2", got)
+	}
+	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1,token-2"; got != want {
+		t.Fatalf("chat tokens = %s, want transition request routed to warmed token-2", got)
+	}
+	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-expiring,token-2-session"; got != want {
+		t.Fatalf("chat session IDs = %s, want old session then warmed successor", got)
+	}
+}
+
+func TestProxyFallsBackToTransitionSessionWhenNextTokenCannotWarm(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	upstream.sessions["token-1"] = []freeSessionResponse{{
+		Status:     string(sessionStatusActive),
+		InstanceID: "token-1-expiring",
+		ExpiresAt:  time.Now().Add(9 * time.Minute).UTC().Format(time.RFC3339),
+	}}
+	upstream.sessionErrors["token-2"] = upstreamError{
+		status: http.StatusTooManyRequests,
+		body:   `{"model":"deepseek/deepseek-v4-pro","resetAt":"` + time.Now().Add(time.Hour).UTC().Format(time.RFC3339) + `","retryAfterMs":3600000,"limit":5,"recentCount":5}`,
+	}
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1", "token-2"})
+
+	first := performChatRequest(t, server)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, body = %s, want 200", first.Code, first.Body.String())
+	}
+
+	second := performChatRequest(t, server)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, body = %s, want 200", second.Code, second.Body.String())
+	}
+
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1,token-2"; got != want {
+		t.Fatalf("session requests = %s, want one failed successor warm attempt", got)
+	}
+	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1,token-1"; got != want {
+		t.Fatalf("chat tokens = %s, want fallback to transition-period token-1", got)
+	}
+	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-expiring,token-1-expiring"; got != want {
+		t.Fatalf("chat session IDs = %s, want old session reused as fallback", got)
+	}
+}
+
+func TestMaintenanceWarmsNextSessionDuringTransition(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	upstream.sessions["token-1"] = []freeSessionResponse{{
+		Status:     string(sessionStatusActive),
+		InstanceID: "token-1-expiring",
+		ExpiresAt:  time.Now().Add(9 * time.Minute).UTC().Format(time.RFC3339),
+	}}
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1", "token-2"})
+
+	first := performChatRequest(t, server)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, body = %s, want 200", first.Code, first.Body.String())
+	}
+
+	server.runs.maintainTransitions(context.Background())
+
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1,token-2"; got != want {
+		t.Fatalf("session requests = %s, want maintenance to warm token-2", got)
+	}
+	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1"; got != want {
+		t.Fatalf("chat tokens = %s, want maintenance warm without a chat attempt", got)
+	}
+
+	second := performChatRequest(t, server)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, body = %s, want 200", second.Code, second.Body.String())
+	}
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1,token-2"; got != want {
+		t.Fatalf("session requests = %s, want no extra session start after warm", got)
+	}
+	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1,token-2"; got != want {
+		t.Fatalf("chat tokens = %s, want transition request routed to warmed token-2", got)
+	}
+}
+
+func TestFlashUsesPassiveTransitionSessionWithoutWarmingNextToken(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	upstream.sessions["token-1"] = []freeSessionResponse{{
+		Status:     string(sessionStatusActive),
+		InstanceID: "token-1-flash-expiring",
+		ExpiresAt:  time.Now().Add(9 * time.Minute).UTC().Format(time.RFC3339),
+	}}
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1", "token-2"})
+
+	first := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, body = %s, want 200", first.Code, first.Body.String())
+	}
+
+	server.runs.maintainTransitions(context.Background())
+
+	second := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi again"}]}`)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, body = %s, want 200", second.Code, second.Body.String())
+	}
+
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1"; got != want {
+		t.Fatalf("session requests = %s, want no proactive warm for non-premium flash", got)
+	}
+	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1,token-1"; got != want {
+		t.Fatalf("chat tokens = %s, want passive flash transition to keep token-1", got)
+	}
+	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-flash-expiring,token-1-flash-expiring"; got != want {
+		t.Fatalf("chat session IDs = %s, want passive reuse of expiring flash session", got)
+	}
+}
+
+func TestFlashPassiveTransitionIsVisibleInSnapshot(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	upstream.sessions["token-1"] = []freeSessionResponse{{
+		Status:     string(sessionStatusActive),
+		InstanceID: "token-1-flash-expiring",
+		ExpiresAt:  time.Now().Add(9 * time.Minute).UTC().Format(time.RFC3339),
+	}}
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1", "token-2"})
+
+	response := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200", response.Code, response.Body.String())
+	}
+
+	snapshots := server.runs.Snapshots()
+	if len(snapshots) == 0 {
+		t.Fatalf("snapshots empty")
+	}
+	if !snapshots[0].SessionTransitioning {
+		t.Fatalf("session transitioning = false, want true for flash inside transition window")
+	}
+	if got, want := snapshots[0].SessionTransitionMode, "passive"; got != want {
+		t.Fatalf("session transition mode = %q, want %q", got, want)
+	}
+	if snapshots[0].SessionRemainingMs <= 0 {
+		t.Fatalf("session remaining ms = %d, want positive value", snapshots[0].SessionRemainingMs)
+	}
+}
+
 func TestFlashSkipsTokenWithExistingPremiumSession(t *testing.T) {
 	upstream, upstreamServer := newTransitionUpstream(t)
 	server := newTransitionServer(upstreamServer.URL, []string{"token-1", "token-2"})

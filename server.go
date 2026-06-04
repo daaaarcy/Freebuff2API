@@ -98,10 +98,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]any{
-		"ok":          true,
-		"started_at":  s.started.UTC(),
-		"uptime_sec":  int(time.Since(s.started).Seconds()),
-		"token_state": s.runs.Snapshots(),
+		"ok":                        true,
+		"started_at":                s.started.UTC(),
+		"uptime_sec":                int(time.Since(s.started).Seconds()),
+		"session_transition_period": s.cfg.SessionTransitionPeriod.String(),
+		"token_state":               s.runs.Snapshots(),
 	}
 	writeJSON(w, http.StatusOK, response)
 }

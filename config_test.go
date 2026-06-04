@@ -21,3 +21,15 @@ func TestDefaultPremiumSessionModelsIncludeMiMoPro(t *testing.T) {
 		t.Fatalf("defaultPremiumSessionModels = %#v, did not expect mimo/mimo-v2.5", defaultPremiumSessionModels)
 	}
 }
+
+func TestDefaultSessionTransitionPeriodIsTenMinutes(t *testing.T) {
+	t.Setenv("AUTH_TOKENS", "token")
+
+	cfg, err := loadConfig("")
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if got, want := cfg.SessionTransitionPeriod.String(), "10m0s"; got != want {
+		t.Fatalf("SessionTransitionPeriod = %s, want %s", got, want)
+	}
+}

@@ -22,7 +22,7 @@ func TestReadySessionRejectsSessionsInsideSafetyWindow(t *testing.T) {
 	}
 }
 
-func TestEnsureSessionRejectsRefreshWhilePremiumSessionInflight(t *testing.T) {
+func TestEnsureSessionReturnsTransitionErrorForExpiringSession(t *testing.T) {
 	pool := &tokenPool{
 		name: "token-1",
 		session: &cachedSession{
@@ -33,16 +33,16 @@ func TestEnsureSessionRejectsRefreshWhilePremiumSessionInflight(t *testing.T) {
 		sessionInflight: 2,
 	}
 
-	instanceID, err := pool.ensureSession(context.Background(), "deepseek/deepseek-v4-pro")
+	instanceID, err := pool.ensureSession(context.Background(), "base2-free-deepseek", "deepseek/deepseek-v4-pro", false)
 	if instanceID != "" {
-		t.Fatalf("instanceID = %q, want empty while refresh is blocked", instanceID)
+		t.Fatalf("instanceID = %q, want empty during transition", instanceID)
 	}
-	var busyErr *sessionBusyError
-	if !errors.As(err, &busyErr) {
-		t.Fatalf("err = %v, want sessionBusyError", err)
+	var transitionErr *sessionTransitionError
+	if !errors.As(err, &transitionErr) {
+		t.Fatalf("err = %v, want sessionTransitionError", err)
 	}
-	if busyErr.Inflight != 2 {
-		t.Fatalf("busy inflight = %d, want 2", busyErr.Inflight)
+	if transitionErr.InstanceID != "session-near-expiry" {
+		t.Fatalf("transition instance ID = %q, want session-near-expiry", transitionErr.InstanceID)
 	}
 }
 
@@ -58,7 +58,7 @@ func TestEnsureSessionRejectsMismatchedFlashWhilePremiumSessionInflight(t *testi
 		sessionInflight: 1,
 	}
 
-	instanceID, err := pool.ensureSession(context.Background(), "deepseek/deepseek-v4-flash")
+	instanceID, err := pool.ensureSession(context.Background(), "base2-free-deepseek-flash", "deepseek/deepseek-v4-flash", false)
 	if instanceID != "" {
 		t.Fatalf("instanceID = %q, want empty for mismatched in-flight pro session", instanceID)
 	}
@@ -80,7 +80,7 @@ func TestEnsureSessionRejectsDifferentPremiumModelWhileSessionInflight(t *testin
 		sessionInflight: 1,
 	}
 
-	instanceID, err := pool.ensureSession(context.Background(), "moonshotai/kimi-k2.6")
+	instanceID, err := pool.ensureSession(context.Background(), "base2-free-kimi", "moonshotai/kimi-k2.6", false)
 	if instanceID != "" {
 		t.Fatalf("instanceID = %q, want empty for mismatched premium in-flight session", instanceID)
 	}

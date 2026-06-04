@@ -4,6 +4,7 @@
   "AUTH_TOKENS": [],
   "ROTATION_INTERVAL": "6h",
   "REQUEST_TIMEOUT": "30m",
+  "SESSION_TRANSITION_PERIOD": "10m",
   "API_KEYS": [],
   "HTTP_PROXY": "",
   "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6", "mimo/mimo-v2.5", "mimo/mimo-v2.5-pro"],

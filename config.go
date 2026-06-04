@@ -13,28 +13,30 @@ import (
 )
 
 type Config struct {
-	ListenAddr            string
-	UpstreamBaseURL       string
-	AuthTokens            []string
-	RotationInterval      time.Duration
-	RequestTimeout        time.Duration
-	UserAgent             string
-	APIKeys               []string
-	HTTPProxy             string
-	SessionRequiredModels []string
-	PremiumSessionModels  []string
+	ListenAddr              string
+	UpstreamBaseURL         string
+	AuthTokens              []string
+	RotationInterval        time.Duration
+	RequestTimeout          time.Duration
+	SessionTransitionPeriod time.Duration
+	UserAgent               string
+	APIKeys                 []string
+	HTTPProxy               string
+	SessionRequiredModels   []string
+	PremiumSessionModels    []string
 }
 
 type rawConfig struct {
-	ListenAddr            string   `json:"LISTEN_ADDR"`
-	UpstreamBaseURL       string   `json:"UPSTREAM_BASE_URL"`
-	AuthTokens            []string `json:"AUTH_TOKENS"`
-	RotationInterval      string   `json:"ROTATION_INTERVAL"`
-	RequestTimeout        string   `json:"REQUEST_TIMEOUT"`
-	APIKeys               []string `json:"API_KEYS"`
-	HTTPProxy             string   `json:"HTTP_PROXY"`
-	SessionRequiredModels []string `json:"SESSION_REQUIRED_MODELS"`
-	PremiumSessionModels  []string `json:"PREMIUM_SESSION_MODELS"`
+	ListenAddr              string   `json:"LISTEN_ADDR"`
+	UpstreamBaseURL         string   `json:"UPSTREAM_BASE_URL"`
+	AuthTokens              []string `json:"AUTH_TOKENS"`
+	RotationInterval        string   `json:"ROTATION_INTERVAL"`
+	RequestTimeout          string   `json:"REQUEST_TIMEOUT"`
+	SessionTransitionPeriod string   `json:"SESSION_TRANSITION_PERIOD"`
+	APIKeys                 []string `json:"API_KEYS"`
+	HTTPProxy               string   `json:"HTTP_PROXY"`
+	SessionRequiredModels   []string `json:"SESSION_REQUIRED_MODELS"`
+	PremiumSessionModels    []string `json:"PREMIUM_SESSION_MODELS"`
 }
 
 var defaultSessionRequiredModels = []string{
@@ -52,6 +54,8 @@ var defaultPremiumSessionModels = []string{
 	"mimo/mimo-v2.5-pro",
 }
 
+const defaultSessionTransitionPeriod = 10 * time.Minute
+
 func loadConfig(configPath string) (Config, error) {
 	cfg, err := loadRawConfig(configPath)
 	if err != nil {
@@ -62,6 +66,7 @@ func loadConfig(configPath string) (Config, error) {
 	overrideString(&cfg.UpstreamBaseURL, "UPSTREAM_BASE_URL")
 	overrideString(&cfg.RotationInterval, "ROTATION_INTERVAL")
 	overrideString(&cfg.RequestTimeout, "REQUEST_TIMEOUT")
+	overrideString(&cfg.SessionTransitionPeriod, "SESSION_TRANSITION_PERIOD")
 	overrideCSV(&cfg.AuthTokens, "AUTH_TOKENS")
 	overrideCSV(&cfg.APIKeys, "API_KEYS")
 	overrideString(&cfg.HTTPProxy, "HTTP_PROXY")
@@ -78,17 +83,23 @@ func loadConfig(configPath string) (Config, error) {
 		return Config{}, fmt.Errorf("parse request timeout: %w", err)
 	}
 
+	sessionTransitionPeriod, err := time.ParseDuration(strings.TrimSpace(cfg.SessionTransitionPeriod))
+	if err != nil {
+		return Config{}, fmt.Errorf("parse session transition period: %w", err)
+	}
+
 	finalCfg := Config{
-		ListenAddr:            strings.TrimSpace(cfg.ListenAddr),
-		UpstreamBaseURL:       normalizeUpstreamBaseURL(cfg.UpstreamBaseURL),
-		AuthTokens:            dedupeStrings(cfg.AuthTokens),
-		RotationInterval:      rotationInterval,
-		RequestTimeout:        requestTimeout,
-		UserAgent:             generateUserAgent(),
-		APIKeys:               dedupeStrings(cfg.APIKeys),
-		HTTPProxy:             strings.TrimSpace(cfg.HTTPProxy),
-		SessionRequiredModels: dedupeStrings(cfg.SessionRequiredModels),
-		PremiumSessionModels:  dedupeStrings(cfg.PremiumSessionModels),
+		ListenAddr:              strings.TrimSpace(cfg.ListenAddr),
+		UpstreamBaseURL:         normalizeUpstreamBaseURL(cfg.UpstreamBaseURL),
+		AuthTokens:              dedupeStrings(cfg.AuthTokens),
+		RotationInterval:        rotationInterval,
+		RequestTimeout:          requestTimeout,
+		SessionTransitionPeriod: sessionTransitionPeriod,
+		UserAgent:               generateUserAgent(),
+		APIKeys:                 dedupeStrings(cfg.APIKeys),
+		HTTPProxy:               strings.TrimSpace(cfg.HTTPProxy),
+		SessionRequiredModels:   dedupeStrings(cfg.SessionRequiredModels),
+		PremiumSessionModels:    dedupeStrings(cfg.PremiumSessionModels),
 	}
 
 	switch {
@@ -102,6 +113,8 @@ func loadConfig(configPath string) (Config, error) {
 		return Config{}, errors.New("ROTATION_INTERVAL must be greater than zero")
 	case finalCfg.RequestTimeout <= 0:
 		return Config{}, errors.New("REQUEST_TIMEOUT must be greater than zero")
+	case finalCfg.SessionTransitionPeriod <= 0:
+		return Config{}, errors.New("SESSION_TRANSITION_PERIOD must be greater than zero")
 	}
 
 	return finalCfg, nil
@@ -127,12 +140,13 @@ func normalizeUpstreamBaseURL(raw string) string {
 
 func loadRawConfig(configPath string) (rawConfig, error) {
 	cfg := rawConfig{
-		ListenAddr:            ":8080",
-		UpstreamBaseURL:       "https://www.codebuff.com",
-		RotationInterval:      "6h",
-		RequestTimeout:        "30m",
-		SessionRequiredModels: append([]string(nil), defaultSessionRequiredModels...),
-		PremiumSessionModels:  append([]string(nil), defaultPremiumSessionModels...),
+		ListenAddr:              ":8080",
+		UpstreamBaseURL:         "https://www.codebuff.com",
+		RotationInterval:        "6h",
+		RequestTimeout:          "30m",
+		SessionTransitionPeriod: defaultSessionTransitionPeriod.String(),
+		SessionRequiredModels:   append([]string(nil), defaultSessionRequiredModels...),
+		PremiumSessionModels:    append([]string(nil), defaultPremiumSessionModels...),
 	}
 
 	if configPath != "" {

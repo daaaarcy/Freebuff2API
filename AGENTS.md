@@ -65,6 +65,7 @@ Upstream (www.codebuff.com)
   "AUTH_TOKENS": ["token1", "token2"],
   "ROTATION_INTERVAL": "6h",
   "REQUEST_TIMEOUT": "30m",
+  "SESSION_TRANSITION_PERIOD": "10m",
   "API_KEYS": ["optional-client-facing-key"],
   "HTTP_PROXY": "",
   "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6", "mimo/mimo-v2.5", "mimo/mimo-v2.5-pro"],
@@ -132,13 +133,15 @@ Lifecycle: `ensureSession()` → check shared cache → `refreshSession()` → P
 
 For session-required models, `RunManager.Acquire()` calls `ensureSession()` before leasing the run and returns the selected session instance ID to `proxyChatRequest`; handlers should not call `ensureSession()` a second time for the same request.
 
-Active sessions are treated as stale inside the final 2 minutes before `expiresAt` (`freeSessionRefreshSafetyWindow`) so normal requests refresh before hitting upstream `session_expired`. If the session has in-flight requests, refresh is deferred and the request fails over to another token instead of ending the active session.
+Premium active sessions enter a configurable proactive transition period inside the final `SESSION_TRANSITION_PERIOD` before `expiresAt` (default `10m`). During that window, the manager warms the next available token for the same model and routes new requests to the warmed successor when possible. The old premium session remains available for in-flight work and as a fallback if no successor can be warmed.
+
+Non-premium active sessions do not proactively transition because their expiry behavior is not confirmed. During the same final window they stay in passive transition: requests keep using the current session until actual expiry, and the pool logs the model, premium flag, instance ID, expiry, and remaining time for investigation.
 
 If a premium model requests a different active premium session and that session has no in-flight requests, the old session is ended before starting the requested model session. If it has in-flight requests, the request fails over instead of interrupting the long-running stream.
 
 `deepseek/deepseek-v4-flash` is session-required but not premium-counted. If a token already has an active session, flash may reuse that session instance ID even when it was started for a premium model; it should not tear down a premium session just to run flash.
 
-Session starts are logged with token, model, premium flag, instance ID, expiry, and per-model start count. `/healthz` exposes `session_model`, `session_premium`, and `session_started_counts` for each token.
+Session starts are logged with token, model, premium flag, instance ID, expiry, and per-model start count. `/healthz` exposes `session_model`, `session_premium`, `session_remaining_ms`, `session_transitioning`, `session_transition_mode`, and `session_started_counts` for each token.
 
 ## Upstream Request Injection
 
@@ -206,7 +209,7 @@ go test -count=1 ./...              # tests
 ## Common Gotchas
 
 - **429 rate limits** are per-model, per-token, daily quota (resets midnight Pacific / ~3pm SGT)
-- **Sessions expire** after 1h — cached sessions refresh 2 minutes before expiry, but long streams can still cross the upstream expiry boundary after response bytes are already sent
+- **Sessions expire** after upstream's `expiresAt` — premium sessions proactively warm the next token before expiry, non-premium sessions remain passive and logged, and long streams can still cross the upstream expiry boundary after response bytes are already sent
 - **Prewarm only warms pool 0** — backup pools have no runs until first failover, expect slight latency on first backup request
 - **Invalid tokens** (logged out) cause 404 on StartRun — remove from config or re-login
 - **Model registry** fetches from GitHub — if fetch fails, hardcoded fallback is used (may be stale)

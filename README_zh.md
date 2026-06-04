@@ -65,6 +65,7 @@ npm i -g freebuff
   "AUTH_TOKENS": ["token"],
   "ROTATION_INTERVAL": "6h",
   "REQUEST_TIMEOUT": "30m",
+  "SESSION_TRANSITION_PERIOD": "10m",
   "API_KEYS": [],
   "HTTP_PROXY": "",
   "SESSION_REQUIRED_MODELS": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6", "mimo/mimo-v2.5", "mimo/mimo-v2.5-pro"],
@@ -81,6 +82,7 @@ npm i -g freebuff
 | `AUTH_TOKENS` | Freebuff Auth Token（JSON 数组或逗号分隔的环境变量） |
 | `ROTATION_INTERVAL` | Run 自动轮换间隔（默认 `6h`） |
 | `REQUEST_TIMEOUT` | 上游请求超时时间（默认 `30m`） |
+| `SESSION_TRANSITION_PERIOD` | Premium session 过期前预热并优先使用下一个可用 session 的时间窗口（默认 `10m`） |
 | `API_KEYS` | 客户端鉴权 API Key（留空则无需鉴权） |
 | `HTTP_PROXY` | 上游 HTTP 代理地址 |
 | `SESSION_REQUIRED_MODELS` | 需要共享 Freebuff 会话实例 ID 的模型 |

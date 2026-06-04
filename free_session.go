@@ -13,8 +13,7 @@ import (
 )
 
 const (
-	freeSessionPollInterval        = 5 * time.Second
-	freeSessionRefreshSafetyWindow = 2 * time.Minute
+	freeSessionPollInterval = 5 * time.Second
 )
 
 type sessionStatus string
@@ -44,6 +43,7 @@ type freeSessionResponse struct {
 type cachedSession struct {
 	status     sessionStatus
 	instanceID string
+	agentID    string
 	model      string
 	expiresAt  time.Time
 	position   int
@@ -79,6 +79,27 @@ type sessionModelLockedError struct {
 	ExpiresAt      time.Time
 }
 
+type sessionTransitionError struct {
+	Token      string
+	Model      string
+	InstanceID string
+	ExpiresAt  time.Time
+}
+
+func (e *sessionTransitionError) Error() string {
+	message := "free session is in transition period"
+	if e.Token != "" {
+		message += " for " + e.Token
+	}
+	if e.Model != "" {
+		message += " model=" + e.Model
+	}
+	if !e.ExpiresAt.IsZero() {
+		message += fmt.Sprintf(", expires at %s", e.ExpiresAt.Format(time.RFC3339))
+	}
+	return message
+}
+
 func (e *sessionModelLockedError) Error() string {
 	message := "free session is locked to a different model"
 	if e.Token != "" {
@@ -93,18 +114,29 @@ func (e *sessionModelLockedError) Error() string {
 	return message
 }
 
-func (p *tokenPool) ensureSession(ctx context.Context, model string) (string, error) {
+func (p *tokenPool) ensureSession(ctx context.Context, agentID, model string, allowTransition bool) (string, error) {
 	for {
 		p.mu.Lock()
+		now := time.Now()
 		session := p.session
 		if sessionModelMismatch(session, model) && p.cfg.RequiresPremiumSession(model) && p.sessionInflight > 0 {
 			busyErr := &sessionBusyError{Token: p.name, ExpiresAt: session.expiresAt, Inflight: p.sessionInflight}
 			p.mu.Unlock()
 			return "", busyErr
 		}
-		if instanceID, ready := p.readySessionLocked(model, time.Now()); ready {
+		if instanceID, ready := p.readySessionLocked(model, now); ready {
+			p.logPassiveTransitionLocked(session, model, now)
 			p.mu.Unlock()
 			return instanceID, nil
+		}
+		if transitionErr := p.transitionErrorLocked(model, now); transitionErr != nil {
+			if allowTransition {
+				instanceID := transitionErr.InstanceID
+				p.mu.Unlock()
+				return instanceID, nil
+			}
+			p.mu.Unlock()
+			return "", transitionErr
 		}
 		if sessionModelMismatch(session, model) && session != nil && session.status == sessionStatusActive && session.instanceID != "" && (session.expiresAt.IsZero() || time.Now().Before(session.expiresAt)) {
 			err := &sessionModelLockedError{
@@ -116,7 +148,7 @@ func (p *tokenPool) ensureSession(ctx context.Context, model string) (string, er
 			p.mu.Unlock()
 			return "", err
 		}
-		if waitingErr := waitingRoomErrorFromSession(p.name, session, time.Now()); waitingErr != nil {
+		if waitingErr := waitingRoomErrorFromSession(p.name, session, now); waitingErr != nil {
 			p.mu.Unlock()
 			return "", waitingErr
 		}
@@ -138,7 +170,7 @@ func (p *tokenPool) ensureSession(ctx context.Context, model string) (string, er
 		p.sessionRefreshCh = ch
 		p.mu.Unlock()
 
-		newSession, instanceID, err := p.refreshSession(ctx, model)
+		newSession, instanceID, err := p.refreshSession(ctx, agentID, model)
 
 		p.mu.Lock()
 		if newSession != nil {
@@ -183,11 +215,79 @@ func (p *tokenPool) readySessionLocked(model string, now time.Time) (string, boo
 		if sessionModelMismatch(session, model) {
 			return "", false
 		}
-		if session.expiresAt.IsZero() || now.Before(session.expiresAt.Add(-freeSessionRefreshSafetyWindow)) {
+		if session.expiresAt.IsZero() {
+			return session.instanceID, true
+		}
+		if !now.Before(session.expiresAt) {
+			return "", false
+		}
+		if !p.cfg.RequiresPremiumSession(model) {
+			return session.instanceID, true
+		}
+		if now.Before(session.expiresAt.Add(-p.sessionTransitionPeriod())) {
 			return session.instanceID, true
 		}
 	}
 	return "", false
+}
+
+func (p *tokenPool) transitionErrorLocked(model string, now time.Time) *sessionTransitionError {
+	if !p.cfg.RequiresPremiumSession(model) {
+		return nil
+	}
+	session := p.session
+	if session == nil || session.status != sessionStatusActive || session.instanceID == "" {
+		return nil
+	}
+	if sessionModelMismatch(session, model) || session.expiresAt.IsZero() || !now.Before(session.expiresAt) {
+		return nil
+	}
+	if now.Before(session.expiresAt.Add(-p.sessionTransitionPeriod())) {
+		return nil
+	}
+	return &sessionTransitionError{
+		Token:      p.name,
+		Model:      strings.TrimSpace(model),
+		InstanceID: session.instanceID,
+		ExpiresAt:  session.expiresAt,
+	}
+}
+
+func (p *tokenPool) sessionTransitionPeriod() time.Duration {
+	if p.cfg.SessionTransitionPeriod > 0 {
+		return p.cfg.SessionTransitionPeriod
+	}
+	return defaultSessionTransitionPeriod
+}
+
+func (p *tokenPool) logPassiveTransitionLocked(session *cachedSession, model string, now time.Time) {
+	if session == nil || p.cfg.RequiresPremiumSession(model) || session.expiresAt.IsZero() || !now.Before(session.expiresAt) {
+		return
+	}
+	if now.Before(session.expiresAt.Add(-p.sessionTransitionPeriod())) {
+		return
+	}
+	key := session.instanceID
+	if key == "" {
+		return
+	}
+	if p.passiveTransitionLog == nil {
+		p.passiveTransitionLog = make(map[string]bool)
+	}
+	if p.passiveTransitionLog[key] {
+		return
+	}
+	p.passiveTransitionLog[key] = true
+	if p.logger != nil {
+		p.logger.Printf(
+			"%s: free session transition model=%s premium=false action=passive instance_id=%s expires_at=%s remaining=%s",
+			p.name,
+			strings.TrimSpace(model),
+			session.instanceID,
+			session.expiresAt.Format(time.RFC3339),
+			session.expiresAt.Sub(now).Round(time.Second),
+		)
+	}
 }
 
 func sessionModelMismatch(session *cachedSession, requestedModel string) bool {
@@ -222,7 +322,7 @@ func (p *tokenPool) recordSessionStartLocked(session *cachedSession) {
 	)
 }
 
-func (p *tokenPool) refreshSession(ctx context.Context, model string) (*cachedSession, string, error) {
+func (p *tokenPool) refreshSession(ctx context.Context, agentID, model string) (*cachedSession, string, error) {
 	p.mu.Lock()
 	hasExistingSession := p.session != nil && p.session.status != sessionStatusDisabled && p.session.instanceID != ""
 	p.mu.Unlock()
@@ -253,6 +353,7 @@ func (p *tokenPool) refreshSession(ctx context.Context, model string) (*cachedSe
 			return &cachedSession{
 				status:     sessionStatusActive,
 				instanceID: instanceID,
+				agentID:    strings.TrimSpace(agentID),
 				model:      strings.TrimSpace(model),
 				expiresAt:  expiresAt,
 			}, instanceID, nil
@@ -266,6 +367,7 @@ func (p *tokenPool) refreshSession(ctx context.Context, model string) (*cachedSe
 			return &cachedSession{
 				status:     sessionStatusQueued,
 				instanceID: instanceID,
+				agentID:    strings.TrimSpace(agentID),
 				model:      strings.TrimSpace(model),
 				position:   maxInt(state.Position, 1),
 				queueDepth: maxInt(state.QueueDepth, maxInt(state.Position, 1)),

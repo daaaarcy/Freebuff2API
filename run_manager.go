@@ -33,6 +33,7 @@ type tokenPool struct {
 	sessionRefreshCh     chan struct{}
 	sessionInflight      int
 	sessionStartedCounts map[string]int
+	passiveTransitionLog map[string]bool
 	lastError            string
 	cooldownUntil        time.Time
 	modelCooldowns       map[string]modelCooldown
@@ -59,22 +60,25 @@ type runLease struct {
 }
 
 type tokenSnapshot struct {
-	Name                 string                  `json:"name"`
-	Runs                 []runSnapshot           `json:"runs"`
-	DrainingRuns         int                     `json:"draining_runs"`
-	SessionStatus        string                  `json:"session_status,omitempty"`
-	SessionModel         string                  `json:"session_model,omitempty"`
-	SessionPremium       bool                    `json:"session_premium"`
-	SessionInstanceID    string                  `json:"session_instance_id,omitempty"`
-	SessionExpiresAt     time.Time               `json:"session_expires_at,omitempty"`
-	SessionPosition      int                     `json:"session_position,omitempty"`
-	SessionQueueDepth    int                     `json:"session_queue_depth,omitempty"`
-	SessionPollAt        time.Time               `json:"session_poll_at,omitempty"`
-	SessionInflight      int                     `json:"session_inflight,omitempty"`
-	SessionStartedCounts map[string]int          `json:"session_started_counts,omitempty"`
-	CooldownUntil        time.Time               `json:"cooldown_until,omitempty"`
-	ModelCooldowns       []modelCooldownSnapshot `json:"model_cooldowns,omitempty"`
-	LastError            string                  `json:"last_error,omitempty"`
+	Name                  string                  `json:"name"`
+	Runs                  []runSnapshot           `json:"runs"`
+	DrainingRuns          int                     `json:"draining_runs"`
+	SessionStatus         string                  `json:"session_status,omitempty"`
+	SessionModel          string                  `json:"session_model,omitempty"`
+	SessionPremium        bool                    `json:"session_premium"`
+	SessionInstanceID     string                  `json:"session_instance_id,omitempty"`
+	SessionExpiresAt      time.Time               `json:"session_expires_at,omitempty"`
+	SessionRemainingMs    int64                   `json:"session_remaining_ms,omitempty"`
+	SessionTransitioning  bool                    `json:"session_transitioning"`
+	SessionTransitionMode string                  `json:"session_transition_mode,omitempty"`
+	SessionPosition       int                     `json:"session_position,omitempty"`
+	SessionQueueDepth     int                     `json:"session_queue_depth,omitempty"`
+	SessionPollAt         time.Time               `json:"session_poll_at,omitempty"`
+	SessionInflight       int                     `json:"session_inflight,omitempty"`
+	SessionStartedCounts  map[string]int          `json:"session_started_counts,omitempty"`
+	CooldownUntil         time.Time               `json:"cooldown_until,omitempty"`
+	ModelCooldowns        []modelCooldownSnapshot `json:"model_cooldowns,omitempty"`
+	LastError             string                  `json:"last_error,omitempty"`
 }
 
 type modelCooldownSnapshot struct {
@@ -162,6 +166,7 @@ func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunM
 			client:               client,
 			runs:                 make(map[string]*managedRun),
 			sessionStartedCounts: make(map[string]int),
+			passiveTransitionLog: make(map[string]bool),
 			modelCooldowns:       make(map[string]modelCooldown),
 			logger:               logger,
 		})
@@ -196,6 +201,7 @@ func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
 						m.logger.Printf("%s: maintenance failed: %v", pool.name, err)
 					}
 				}
+				m.maintainTransitions(maintainCtx)
 				cancel()
 			case <-m.stopCh:
 				return
@@ -240,10 +246,19 @@ func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLe
 	var waiting []*waitingRoomError
 	var rateLimits []*rateLimitError
 	var cooldowns []*cooldownError
+	var transitionFallback *tokenPool
 	for _, pool := range m.pools {
-		lease, sessionInstanceID, err := pool.acquire(ctx, agentID, model)
+		lease, sessionInstanceID, err := pool.acquire(ctx, agentID, model, false)
 		if err == nil {
 			return lease, sessionInstanceID, nil
+		}
+		var transitionErr *sessionTransitionError
+		if errors.As(err, &transitionErr) {
+			if transitionFallback == nil {
+				transitionFallback = pool
+			}
+			errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
+			continue
 		}
 		var waitingErr *waitingRoomError
 		if errors.As(err, &waitingErr) {
@@ -265,6 +280,15 @@ func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLe
 		}
 		// Cooldown or other transient errors — also try next pool.
 		errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
+	}
+
+	if transitionFallback != nil {
+		lease, sessionInstanceID, err := transitionFallback.acquire(ctx, agentID, model, true)
+		if err == nil {
+			m.logger.Printf("%s: using transition-period session for model %s because no warmed successor was available", transitionFallback.name, model)
+			return lease, sessionInstanceID, nil
+		}
+		errs = append(errs, fmt.Sprintf("%s transition fallback: %v", transitionFallback.name, err))
 	}
 
 	transitionErrors := len(waiting) + len(rateLimits) + len(cooldowns)
@@ -321,7 +345,7 @@ func (m *RunManager) Snapshots() []tokenSnapshot {
 	return snapshots
 }
 
-func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLease, string, error) {
+func (p *tokenPool) acquire(ctx context.Context, agentID, model string, allowTransition bool) (*runLease, string, error) {
 	p.mu.Lock()
 	now := time.Now()
 	if now.Before(p.cooldownUntil) {
@@ -346,7 +370,7 @@ func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLea
 	var sessionInstanceID string
 	if p.cfg.RequiresFreeSession(model) {
 		var err error
-		sessionInstanceID, err = p.ensureSession(ctx, model)
+		sessionInstanceID, err = p.ensureSession(ctx, agentID, model, allowTransition)
 		if err != nil {
 			var rateErr *rateLimitError
 			if errors.As(err, &rateErr) && rateErr.RetryAfter > 0 {
@@ -368,6 +392,88 @@ func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLea
 		p.sessionInflight++
 	}
 	return &runLease{pool: p, run: run, sessionInstanceID: sessionInstanceID}, sessionInstanceID, nil
+}
+
+func (m *RunManager) maintainTransitions(ctx context.Context) {
+	now := time.Now()
+	for index, pool := range m.pools {
+		agentID, model, expiresAt, ok := pool.transitionCandidate(now)
+		if !ok {
+			continue
+		}
+		for _, successor := range m.pools[index+1:] {
+			if successor.hasReadySession(model, now) {
+				break
+			}
+			if err := successor.warm(ctx, agentID, model); err != nil {
+				m.logger.Printf("%s: transition warm for model %s from %s failed: %v", successor.name, model, pool.name, err)
+				continue
+			}
+			m.logger.Printf("%s: warmed transition successor for model %s from %s expiring at %s", successor.name, model, pool.name, expiresAt.Format(time.RFC3339))
+			break
+		}
+	}
+}
+
+func (p *tokenPool) transitionCandidate(now time.Time) (string, string, time.Time, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	session := p.session
+	if session == nil || session.status != sessionStatusActive || session.instanceID == "" {
+		return "", "", time.Time{}, false
+	}
+	if !p.cfg.RequiresPremiumSession(session.model) {
+		return "", "", time.Time{}, false
+	}
+	if session.agentID == "" || session.model == "" || session.expiresAt.IsZero() {
+		return "", "", time.Time{}, false
+	}
+	if !now.Before(session.expiresAt) || now.Before(session.expiresAt.Add(-p.sessionTransitionPeriod())) {
+		return "", "", time.Time{}, false
+	}
+	return session.agentID, session.model, session.expiresAt, true
+}
+
+func (p *tokenPool) hasReadySession(model string, now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ready := p.readySessionLocked(model, now)
+	return ready
+}
+
+func (p *tokenPool) warm(ctx context.Context, agentID, model string) error {
+	p.mu.Lock()
+	now := time.Now()
+	if now.Before(p.cooldownUntil) {
+		cooldownUntil := p.cooldownUntil
+		p.mu.Unlock()
+		return &cooldownError{Until: cooldownUntil}
+	}
+	if cooldown, ok := p.modelCooldownLocked(model, now); ok {
+		p.mu.Unlock()
+		return &cooldownError{Until: cooldown.Until, Model: strings.TrimSpace(model), Reason: cooldown.Reason}
+	}
+	run := p.runs[agentID]
+	needsRotate := run == nil || time.Since(run.startedAt) >= p.cfg.RotationInterval
+	p.mu.Unlock()
+
+	if needsRotate {
+		if err := p.rotateAgent(ctx, agentID); err != nil {
+			return err
+		}
+	}
+
+	if p.cfg.RequiresFreeSession(model) {
+		if _, err := p.ensureSession(ctx, agentID, model, false); err != nil {
+			var rateErr *rateLimitError
+			if errors.As(err, &rateErr) && rateErr.RetryAfter > 0 {
+				p.markModelCooldown(model, rateErr.RetryAfter, fmt.Sprintf("rate limited for %s", model))
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func bestWaitingRoomError(waiting []*waitingRoomError) *waitingRoomError {
@@ -436,14 +542,17 @@ func (p *tokenPool) maintain(ctx context.Context) error {
 	p.mu.Lock()
 	hasSession := p.session != nil
 	sessionModel := ""
+	sessionAgentID := ""
 	if p.session != nil {
 		sessionModel = p.session.model
+		sessionAgentID = p.session.agentID
 	}
 	p.mu.Unlock()
 	if hasSession {
-		if _, err := p.ensureSession(ctx, sessionModel); err != nil {
+		if _, err := p.ensureSession(ctx, sessionAgentID, sessionModel, true); err != nil {
 			var busyErr *sessionBusyError
-			if !errors.As(err, &busyErr) {
+			var transitionErr *sessionTransitionError
+			if !errors.As(err, &busyErr) && !errors.As(err, &transitionErr) {
 				p.logger.Printf("%s: refresh free session failed: %v", p.name, err)
 			}
 		}
@@ -695,6 +804,22 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 		snapshot.SessionPremium = p.cfg.RequiresPremiumSession(p.session.model)
 		snapshot.SessionInstanceID = p.session.instanceID
 		snapshot.SessionExpiresAt = p.session.expiresAt
+		if !p.session.expiresAt.IsZero() {
+			remaining := p.session.expiresAt.Sub(now)
+			if remaining > 0 {
+				snapshot.SessionRemainingMs = remaining.Milliseconds()
+			}
+			snapshot.SessionTransitioning = p.session.status == sessionStatusActive &&
+				now.Before(p.session.expiresAt) &&
+				!now.Before(p.session.expiresAt.Add(-p.sessionTransitionPeriod()))
+			if snapshot.SessionTransitioning {
+				if p.cfg.RequiresPremiumSession(p.session.model) {
+					snapshot.SessionTransitionMode = "proactive"
+				} else {
+					snapshot.SessionTransitionMode = "passive"
+				}
+			}
+		}
 		snapshot.SessionPosition = p.session.position
 		snapshot.SessionQueueDepth = p.session.queueDepth
 		snapshot.SessionPollAt = p.session.pollAt
