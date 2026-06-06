@@ -254,6 +254,7 @@ func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLe
 	var waiting []*waitingRoomError
 	var rateLimits []*rateLimitError
 	var cooldowns []*cooldownError
+	sessionBlocks := 0
 	var transitionFallback *tokenPool
 	for _, pool := range m.pools {
 		lease, sessionInstanceID, err := pool.acquire(ctx, agentID, model, false)
@@ -286,6 +287,13 @@ func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLe
 			errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
 			continue
 		}
+		var busyErr *sessionBusyError
+		var lockedErr *sessionModelLockedError
+		if errors.As(err, &busyErr) || errors.As(err, &lockedErr) {
+			sessionBlocks++
+			errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
+			continue
+		}
 		// Cooldown or other transient errors — also try next pool.
 		errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
 	}
@@ -299,7 +307,7 @@ func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLe
 		errs = append(errs, fmt.Sprintf("%s transition fallback: %v", transitionFallback.name, err))
 	}
 
-	transitionErrors := len(waiting) + len(rateLimits) + len(cooldowns)
+	transitionErrors := len(waiting) + len(rateLimits) + len(cooldowns) + sessionBlocks
 	if len(waiting) > 0 && transitionErrors == len(m.pools) {
 		return nil, "", bestWaitingRoomError(waiting)
 	}

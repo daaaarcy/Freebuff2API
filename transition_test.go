@@ -32,6 +32,7 @@ type transitionUpstream struct {
 	starts             map[string]int
 	sessions           map[string][]freeSessionResponse
 	sessionErrors      map[string]upstreamError
+	sessionErrorOnce   map[string][]upstreamError
 	modelSessionErrors map[string]upstreamError
 	chatStatuses       map[string][]upstreamError
 	chatDrops          map[string]int
@@ -53,6 +54,7 @@ func newTransitionUpstream(t *testing.T) (*transitionUpstream, *httptest.Server)
 		starts:             make(map[string]int),
 		sessions:           make(map[string][]freeSessionResponse),
 		sessionErrors:      make(map[string]upstreamError),
+		sessionErrorOnce:   make(map[string][]upstreamError),
 		modelSessionErrors: make(map[string]upstreamError),
 		chatStatuses:       make(map[string][]upstreamError),
 		chatDrops:          make(map[string]int),
@@ -111,6 +113,14 @@ func (u *transitionUpstream) handleSession(w http.ResponseWriter, r *http.Reques
 		u.mu.Unlock()
 		w.WriteHeader(configured.status)
 		_, _ = w.Write([]byte(configured.body))
+		return
+	}
+	if responses := u.sessionErrorOnce[token]; len(responses) > 0 {
+		response := responses[0]
+		u.sessionErrorOnce[token] = responses[1:]
+		u.mu.Unlock()
+		w.WriteHeader(response.status)
+		_, _ = w.Write([]byte(response.body))
 		return
 	}
 	if configured, ok := u.sessionErrors[token]; ok {
@@ -567,6 +577,66 @@ func TestFlashSkipsTokenWithInflightPremiumSession(t *testing.T) {
 	}
 }
 
+func TestPremiumRequestReplacesIdleMismatchedFlashSession(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1", "token-2"})
+
+	flash := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
+	if flash.Code != http.StatusOK {
+		t.Fatalf("flash status = %d, body = %s, want 200", flash.Code, flash.Body.String())
+	}
+
+	pro := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)
+	if pro.Code != http.StatusOK {
+		t.Fatalf("pro status = %d, body = %s, want 200", pro.Code, pro.Body.String())
+	}
+
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1,token-1"; got != want {
+		t.Fatalf("session requests = %s, want pro to replace idle flash session on token-1", got)
+	}
+	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1,token-1"; got != want {
+		t.Fatalf("chat tokens = %s, want pro to stay on token-1 after replacing idle flash", got)
+	}
+	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-session,token-1-session"; got != want {
+		t.Fatalf("chat session IDs = %s, want refreshed token-1 session reused in chat", got)
+	}
+
+	snapshots := server.runs.Snapshots()
+	if got := snapshots[0].SessionModel; got != transitionTestModel {
+		t.Fatalf("session model = %q, want replaced pro model", got)
+	}
+	if got := snapshots[0].SessionStartedCounts[transitionFlashModel]; got != 1 {
+		t.Fatalf("flash session starts = %d, want 1", got)
+	}
+	if got := snapshots[0].SessionStartedCounts[transitionTestModel]; got != 1 {
+		t.Fatalf("pro session starts = %d, want 1", got)
+	}
+}
+
+func TestPremiumRequestClearsUpstreamModelLock(t *testing.T) {
+	upstream, upstreamServer := newTransitionUpstream(t)
+	upstream.sessionErrorOnce["token-1"] = []upstreamError{{
+		status: http.StatusConflict,
+		body:   `{"status":"model_locked","currentModel":"deepseek/deepseek-v4-flash","requestedModel":"deepseek/deepseek-v4-pro","accessTier":"full"}`,
+	}}
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1"})
+
+	pro := performChatRequestBody(t, server, `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`)
+	if pro.Code != http.StatusOK {
+		t.Fatalf("pro status = %d, body = %s, want 200", pro.Code, pro.Body.String())
+	}
+
+	if got, want := strings.Join(upstream.sessionRequestSequence(), ","), "token-1,token-1"; got != want {
+		t.Fatalf("session requests = %s, want stale upstream lock cleared and retried", got)
+	}
+	if got, want := strings.Join(upstream.chatTokenSequence(), ","), "token-1"; got != want {
+		t.Fatalf("chat tokens = %s, want token-1 after clearing stale lock", got)
+	}
+	if got, want := strings.Join(upstream.chatSessionSequence(), ","), "token-1-session"; got != want {
+		t.Fatalf("chat session IDs = %s, want refreshed token-1 session", got)
+	}
+}
+
 func TestAcquireReturnsBestWaitingRoomWhenAllTokensQueued(t *testing.T) {
 	upstream, upstreamServer := newTransitionUpstream(t)
 	upstream.sessions["token-1"] = []freeSessionResponse{{
@@ -647,6 +717,33 @@ func TestAcquireReturnsEarliestRateLimitWhenAllTokensLimited(t *testing.T) {
 	}
 	if got, want := rateErr.RetryAfter, 30*time.Minute; got != want {
 		t.Fatalf("retry after = %v, want %v", got, want)
+	}
+}
+
+func TestAcquireReturnsModelCooldownWhenOtherTokensAreBusy(t *testing.T) {
+	_, upstreamServer := newTransitionUpstream(t)
+	server := newTransitionServer(upstreamServer.URL, []string{"token-1", "token-2"})
+
+	flashLease, _, err := server.runs.Acquire(context.Background(), transitionFlashAgent, transitionFlashModel)
+	if err != nil {
+		t.Fatalf("acquire flash lease: %v", err)
+	}
+	defer server.runs.Release(flashLease)
+	server.runs.pools[1].markModelCooldown(transitionTestModel, time.Hour, "rate limited for deepseek/deepseek-v4-pro")
+
+	lease, _, err := server.runs.Acquire(context.Background(), transitionTestAgent, transitionTestModel)
+	if lease != nil {
+		t.Fatalf("lease = %#v, want nil", lease)
+	}
+	var cooldownErr *cooldownError
+	if !errors.As(err, &cooldownErr) {
+		t.Fatalf("err = %v, want cooldownError", err)
+	}
+	if got := cooldownErr.Model; got != transitionTestModel {
+		t.Fatalf("cooldown model = %q, want %q", got, transitionTestModel)
+	}
+	if got := cooldownErr.Reason; got != "rate limited for deepseek/deepseek-v4-pro" {
+		t.Fatalf("cooldown reason = %q, want rate limit reason", got)
 	}
 }
 

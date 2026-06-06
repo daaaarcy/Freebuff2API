@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -138,7 +139,7 @@ func (p *tokenPool) ensureSession(ctx context.Context, agentID, model string, al
 			p.mu.Unlock()
 			return "", transitionErr
 		}
-		if sessionModelMismatch(session, model) && session != nil && session.status == sessionStatusActive && session.instanceID != "" && (session.expiresAt.IsZero() || time.Now().Before(session.expiresAt)) {
+		if sessionModelMismatch(session, model) && !p.cfg.RequiresPremiumSession(model) && session != nil && session.status == sessionStatusActive && session.instanceID != "" && (session.expiresAt.IsZero() || time.Now().Before(session.expiresAt)) {
 			err := &sessionModelLockedError{
 				Token:          p.name,
 				CurrentModel:   strings.TrimSpace(session.model),
@@ -368,6 +369,16 @@ func (p *tokenPool) refreshSession(ctx context.Context, agentID, model string) (
 	}
 
 	state, err := p.client.CreateOrRefreshSession(ctx, p.token, model)
+	if err != nil {
+		var lockedErr *sessionModelLockedError
+		if p.cfg.RequiresPremiumSession(model) && errors.As(err, &lockedErr) {
+			p.logger.Printf("%s: upstream free session locked to %s while requesting premium %s, ending stale session and retrying", p.name, lockedErr.CurrentModel, strings.TrimSpace(model))
+			if endErr := p.client.EndSession(ctx, p.token); endErr != nil {
+				return nil, "", fmt.Errorf("end model-locked free session: %w", endErr)
+			}
+			state, err = p.client.CreateOrRefreshSession(ctx, p.token, model)
+		}
+	}
 	if err != nil {
 		return nil, "", fmt.Errorf("start free session: %w", err)
 	}
@@ -615,6 +626,11 @@ func (c *UpstreamClient) doSessionRequestWithModel(ctx context.Context, method, 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return freeSessionResponse{}, parseRateLimitError(responseBody)
 	}
+	if resp.StatusCode == http.StatusConflict {
+		if lockedErr := parseSessionModelLockedError(responseBody); lockedErr != nil {
+			return freeSessionResponse{}, lockedErr
+		}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return freeSessionResponse{}, fmt.Errorf("free session request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
 	}
@@ -627,6 +643,29 @@ func (c *UpstreamClient) doSessionRequestWithModel(ctx context.Context, method, 
 		return freeSessionResponse{}, fmt.Errorf("free session response missing status")
 	}
 	return parsed, nil
+}
+
+func parseSessionModelLockedError(body []byte) *sessionModelLockedError {
+	var parsed struct {
+		Status         string `json:"status"`
+		Error          string `json:"error"`
+		CurrentModel   string `json:"currentModel"`
+		RequestedModel string `json:"requestedModel"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil
+	}
+	status := strings.TrimSpace(parsed.Status)
+	if status == "" {
+		status = strings.TrimSpace(parsed.Error)
+	}
+	if status != "model_locked" {
+		return nil
+	}
+	return &sessionModelLockedError{
+		CurrentModel:   strings.TrimSpace(parsed.CurrentModel),
+		RequestedModel: strings.TrimSpace(parsed.RequestedModel),
+	}
 }
 
 func parseRateLimitError(body []byte) *rateLimitError {
